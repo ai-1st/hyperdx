@@ -372,6 +372,16 @@ program
     '--no-judge',
     'Run programmatic checks only during auto-grading (skip LLM judge)',
   )
+  .option(
+    '--email <email>',
+    'HyperDX account email for post-run inspection (default: eval@local.test)',
+    'eval@local.test',
+  )
+  .option(
+    '--password <pw>',
+    'HyperDX account password for post-run inspection (default: EvalPass123!#)',
+    'EvalPass123!#',
+  )
   .action(
     async (
       scenarioName: string,
@@ -392,6 +402,8 @@ program
         report: boolean;
         judgeModel: string;
         judge: boolean;
+        email: string;
+        password: string;
       },
     ) => {
       const opts = program.opts<GlobalOpts>();
@@ -555,7 +567,7 @@ program
             const startedMs = Date.now();
             const record = await runCell({
               config,
-              scenario: scenario.name,
+              scenario,
               agentPrompt: scenario.agentPrompt,
               mcp,
               model: cmdOpts.model,
@@ -621,10 +633,24 @@ program
             def: getMcpDefinition(config, k),
           })),
         );
+        // Build inspection config when the scenario has a postRunInspection
+        // hook and the HyperDX API config is available.
+        const inspectionConfig =
+          scenario.postRunInspection && config.hyperdxApi
+            ? {
+                apiUrl: config.hyperdxApi.apiUrl,
+                accessKey: config.hyperdxApi.accessKey,
+                email: cmdOpts.email,
+                password: cmdOpts.password,
+                anchorTimeIso,
+                cleanup: true,
+              }
+            : undefined;
         const gradeOpts: GradeBatchOptions = {
           judgeModel: cmdOpts.judgeModel,
           skipJudge: cmdOpts.judge === false,
           blindingEntries,
+          inspectionConfig,
         };
         const gradeResult = await gradeBatch(batchDir, gradeOpts);
         console.log(
@@ -754,10 +780,26 @@ program
   .option('--judge-model <id>', 'Judge model ID', 'claude-opus-4-7')
   .option('--rerun-judge', 'Re-call judge even if a grade JSON already exists')
   .option('--no-judge', 'Run programmatic checks only (cheap regrade)')
+  .option(
+    '--email <email>',
+    'HyperDX account email for post-run inspection',
+    'eval@local.test',
+  )
+  .option(
+    '--password <pw>',
+    'HyperDX account password for post-run inspection',
+    'EvalPass123!#',
+  )
   .action(
     async (
       batch: string,
-      cmdOpts: { judgeModel: string; rerunJudge?: boolean; judge: boolean },
+      cmdOpts: {
+        judgeModel: string;
+        rerunJudge?: boolean;
+        judge: boolean;
+        email: string;
+        password: string;
+      },
     ) => {
       const dir = resolveBatchDir(batch);
       console.log(`Grading batch at ${dir}`);
@@ -776,11 +818,30 @@ program
           // Config may be stale — grade without blinding.
         }
       }
+      // Build inspection config from eval config if available.
+      let inspectionConfig;
+      if (configExists()) {
+        try {
+          const cfg = readConfig();
+          if (cfg.hyperdxApi) {
+            inspectionConfig = {
+              apiUrl: cfg.hyperdxApi.apiUrl,
+              accessKey: cfg.hyperdxApi.accessKey,
+              email: cmdOpts.email,
+              password: cmdOpts.password,
+              cleanup: true,
+            };
+          }
+        } catch {
+          // Config may be stale — grade without inspection.
+        }
+      }
       const summary = await gradeBatch(dir, {
         judgeModel: cmdOpts.judgeModel,
         rerunJudge: cmdOpts.rerunJudge ?? false,
         skipJudge: cmdOpts.judge === false,
         blindingEntries,
+        inspectionConfig,
       });
       console.log(
         `\nGraded ${summary.graded.length} run${summary.graded.length === 1 ? '' : 's'}; ${summary.errors.length} error${summary.errors.length === 1 ? '' : 's'}.`,
