@@ -112,7 +112,10 @@ import {
   useSavedSearch,
   useUpdateSavedSearch,
 } from '@/savedSearch';
-import { useSearchPageFilterState } from '@/searchFilters';
+import {
+  escapeFilterKeysForSql,
+  useSearchPageFilterState,
+} from '@/searchFilters';
 import { getEventBody, useSource, useSources } from '@/source';
 import { useAppTheme, useBrandDisplayName } from '@/theme/ThemeProvider';
 import {
@@ -694,21 +697,42 @@ function useSearchedConfigToChartConfig(
   { select, source, whereLanguage, where, filters, orderBy }: SearchConfig,
   defaultSearchConfig?: Partial<SearchConfig>,
 ) {
-  const { data: sourceObj, isLoading } = useSource({
+  const { data: sourceObj, isLoading: isSourceLoading } = useSource({
     id: source,
     kinds: [SourceKind.Log, SourceKind.Trace],
   });
   const defaultOrderBy = useDefaultOrderBy(source);
 
+  // Real top-level column names, so a filter key that is a flat column whose
+  // name contains dots (e.g. a materialized column) is quoted as one identifier
+  // rather than mis-parsed as Map/JSON sub-path access by `escapeFilterKeysForSql`.
+  const { data: columns, isLoading: isColumnsLoading } = useColumns(
+    {
+      databaseName: sourceObj?.from.databaseName ?? '',
+      tableName: sourceObj?.from.tableName ?? '',
+      connectionId: sourceObj?.connection ?? '',
+    },
+    { enabled: sourceObj != null },
+  );
+
   return useMemo(() => {
-    if (sourceObj != null) {
+    if (sourceObj != null && !isColumnsLoading) {
       const resolvedOrderBy =
         orderBy || defaultSearchConfig?.orderBy || defaultOrderBy;
+
+      const knownColumns = columns
+        ? new Set(columns.map(c => c.name))
+        : new Set<string>();
 
       const chartConfig = buildSearchChartConfig(sourceObj, {
         where,
         whereLanguage,
-        filters,
+        // Conditionally backtick-quote filter column keys for ClickHouse. The
+        // URL/persisted `filters` stay unquoted; quoting happens only here, at
+        // query-generation time.
+        filters: filters
+          ? escapeFilterKeysForSql(filters, knownColumns)
+          : filters,
         select: select || defaultSearchConfig?.select || null,
         displayType: DisplayType.Search,
         ...(resolvedOrderBy != null ? { orderBy: resolvedOrderBy } : {}),
@@ -719,12 +743,14 @@ function useSearchedConfigToChartConfig(
       };
     }
 
-    return { data: null, isLoading };
+    return { data: null, isLoading: isSourceLoading || isColumnsLoading };
   }, [
     sourceObj,
-    isLoading,
+    isSourceLoading,
+    isColumnsLoading,
     select,
     filters,
+    columns,
     defaultSearchConfig,
     where,
     whereLanguage,

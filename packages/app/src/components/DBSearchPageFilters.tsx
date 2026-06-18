@@ -71,6 +71,7 @@ import { useMetadataWithSettings } from '@/hooks/useMetadata';
 import useResizable from '@/hooks/useResizable';
 import { usePinnedFiltersApi } from '@/pinnedFilters';
 import {
+  escapeFilterKeysForSql,
   FilterStateHook,
   IS_ROOT_SPAN_COLUMN_NAME,
   usePinnedFilters,
@@ -88,7 +89,7 @@ import { SharedFiltersSection } from './DBSearchPageFilters/SharedFilters';
 import {
   getFilterStateEntry,
   groupFacetsByBaseName,
-  toClickHouseKeyExpression,
+  toQuotedClickHouseKeyExpression,
 } from './DBSearchPageFilters/utils';
 
 import resizeStyles from '../../styles/ResizablePanel.module.scss';
@@ -1199,7 +1200,7 @@ const DBSearchPageFiltersComponent = ({
   const isLoading = useExactPipeline ? isFieldsLoading : isMVLoading;
   const error = useExactPipeline ? fieldsError : mvError;
 
-  const { data: columns } = useColumns({
+  const { data: columns, isLoading: isColumnsLoading } = useColumns({
     databaseName: chartConfig.from.databaseName,
     tableName: chartConfig.from.tableName,
     connectionId: chartConfig.connection,
@@ -1293,18 +1294,57 @@ const DBSearchPageFiltersComponent = ({
     [chartConfig, dateRange, filterMode],
   );
 
+  // Real top-level column names, so a flat column whose name contains dots
+  // (e.g. a materialized column) is quoted as one identifier rather than
+  // mis-parsed as Map/JSON sub-path access when we escape facet keys.
+  const knownColumns = useMemo(
+    () => (columns ? new Set(columns.map(c => c.name)) : new Set<string>()),
+    [columns],
+  );
+
+  // `getKeyValues` doesn't escape — it uses each key verbatim both as the SQL
+  // expression and as the result key. So conditionally backtick-quote the facet
+  // keys here (only special-char columns change) and keep a map back to the
+  // original UI key, so the escaped form is used only for the query and never
+  // leaks into the facet list / FilterState / URL.
+  const { escapedKeysToFetch, sqlKeyToUiKey } = useMemo(() => {
+    // Don't fetch any keys until the column list is loaded,
+    // since we need the real column names to escape correctly.
+    if (isColumnsLoading) {
+      return { escapedKeysToFetch: [], sqlKeyToUiKey: new Map() };
+    }
+
+    const sqlKeyToUiKey = new Map<string, string>();
+    const escapedKeysToFetch = keysToFetch.map(key => {
+      const sqlKey = toQuotedClickHouseKeyExpression(key, knownColumns);
+      sqlKeyToUiKey.set(sqlKey, key);
+      return sqlKey;
+    });
+    return { escapedKeysToFetch, sqlKeyToUiKey };
+  }, [isColumnsLoading, keysToFetch, knownColumns]);
+
   // Exact pipeline step 2: fetch values for discovered keys
   const {
-    data: exactFacets,
+    data: rawExactFacets,
     isLoading: isExactFacetsLoading,
     isFetching: isExactFacetsFetching,
   } = useGetKeyValues(
     {
       chartConfig: facetsChartConfig,
       limit: INITIAL_LOAD_LIMIT,
-      keys: keysToFetch,
+      keys: escapedKeysToFetch,
     },
     { enabled: useExactPipeline },
+  );
+
+  // Map the (escaped) result keys back to the original UI keys.
+  const exactFacets = useMemo(
+    () =>
+      rawExactFacets?.map(f => ({
+        ...f,
+        key: sqlKeyToUiKey.get(f.key) ?? f.key,
+      })),
+    [rawExactFacets, sqlKeyToUiKey],
   );
 
   const facets = useExactPipeline ? exactFacets : mvFieldsAndValues;
@@ -1344,12 +1384,13 @@ const DBSearchPageFiltersComponent = ({
       setLoadMoreLoadingKeys(prev => new Set(prev).add(key));
       try {
         // Coerce dot-form Map sub-keys (LogAttributes.foo) into bracket form
-        // (LogAttributes['foo']) before handing them to ClickHouse. Bracket
-        // form is the canonical SQL key produced by mergePath; dot form ends
+        // (LogAttributes['foo']) and conditionally backtick-quote special-char
+        // identifiers before handing them to ClickHouse. `getKeyValues` no
+        // longer escapes, so the caller must pass a valid SQL key; dot form ends
         // up in filterState after setFilterValue's parseKeyPath().join('.')
         // normalization or after a Lucene URL round-trip, and ClickHouse
         // cannot resolve it as map access.
-        const sqlKey = toClickHouseKeyExpression(key);
+        const sqlKey = toQuotedClickHouseKeyExpression(key, knownColumns);
         let newValues: string[];
         if (!useExactPipeline) {
           const results = await metadata.getAllKeyValues({
@@ -1378,7 +1419,10 @@ const DBSearchPageFiltersComponent = ({
             chartConfig: {
               ...chartConfig,
               dateRange,
-              filters: filtersToQuery(strippedFilterState),
+              filters: escapeFilterKeysForSql(
+                filtersToQuery(strippedFilterState),
+                knownColumns,
+              ),
             },
             keys: [sqlKey],
             limit: LOAD_MORE_LOAD_LIMIT,
@@ -1412,6 +1456,7 @@ const DBSearchPageFiltersComponent = ({
       source,
       useExactPipeline,
       sourceTableConnection.metadataMVs,
+      knownColumns,
     ],
   );
 

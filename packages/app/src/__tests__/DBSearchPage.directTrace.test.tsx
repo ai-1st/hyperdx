@@ -112,6 +112,9 @@ jest.mock('@/searchFilters', () => ({
     setFilterValue: jest.fn(),
     clearAllFilters: jest.fn(),
   }),
+  // Identity passthrough — search-side key escaping is irrelevant to these
+  // tests, which only assert the direct-trace filter is applied.
+  escapeFilterKeysForSql: (filters: unknown) => filters,
 }));
 
 jest.mock('@/hooks/useChartConfig', () => ({

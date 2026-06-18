@@ -209,6 +209,154 @@ describe('useDashboardFilters', () => {
     );
   });
 
+  // Dashboard filter `expression`s are verbatim user input, so `filtersToQuery`
+  // emits them unchanged — it does NOT auto-backtick-quote. A column whose name
+  // needs quoting (e.g. `vpc-id`) only works if the filter definition quotes it
+  // itself; a bare `vpc-id` expression is passed through verbatim (and would be
+  // parsed by ClickHouse as `vpc - id`). This keeps both the per-tile queries
+  // (stringifyKeys: true) and the URL-serialized queries (stringifyKeys: false)
+  // backtick-free.
+  describe('dashboard filter expressions are emitted verbatim', () => {
+    const specialCharFilters: DashboardFilter[] = [
+      {
+        id: 'vpcFilter',
+        type: 'QUERY_EXPRESSION',
+        name: 'VPC',
+        expression: 'vpc-id',
+        source: 'logs',
+      },
+    ];
+
+    it('emits a verbatim (unquoted) IN clause for a bare hyphenated expression', () => {
+      const { result } = renderHook(() =>
+        useDashboardFilters(specialCharFilters),
+      );
+
+      act(() => {
+        result.current.setFilterValue('vpc-id', ['vpc-abc', 'vpc-def']);
+      });
+
+      // Per-tile query: keys are wrapped in toString(), with the expression
+      // passed through verbatim (no added backticks).
+      const { result: result2 } = renderHook(() =>
+        useDashboardFilters(specialCharFilters),
+      );
+
+      expect(result2.current.filterQueries).toHaveLength(1);
+      const tileQuery = result2.current.filterQueries[0];
+      const tileCondition = 'condition' in tileQuery ? tileQuery.condition : '';
+      expect(tileCondition).toBe("toString(vpc-id) IN ('vpc-abc', 'vpc-def')");
+
+      // URL-serialized query (stringifyKeys: false) is verbatim too.
+      const urlSerialized = mockSetState.mock.calls.at(-1)?.[0];
+      const urlState =
+        typeof urlSerialized === 'function'
+          ? urlSerialized(null)
+          : urlSerialized;
+      expect(urlState).toEqual([
+        { type: 'sql', condition: "vpc-id IN ('vpc-abc', 'vpc-def')" },
+      ]);
+
+      // The expression-keyed state hydrated from the URL round-trips back to
+      // `vpc-id` so the dashboard filter lookup finds it.
+      expect(Object.keys(result2.current.filterValues)).toEqual(['vpc-id']);
+      expect(result2.current.filterValues['vpc-id'].included).toEqual(
+        new Set(['vpc-abc', 'vpc-def']),
+      );
+    });
+  });
+
+  // Regression: a dashboard filter whose `expression` is already
+  // backtick-quoted — e.g. a JSON sub-column path like
+  // `` `ResourceAttributesJSON`.`key2`.`subKey2` `` — must still hydrate its
+  // selected values from the URL. Dashboard expressions are verbatim, so the
+  // declared (backticked) expression is keyed and serialized to the URL exactly
+  // as written, and `parseQuery` recovers it unchanged — declared expression
+  // and parsed key match by raw equality.
+  describe('backtick-quoted dashboard filter expressions', () => {
+    const jsonPathFilters: DashboardFilter[] = [
+      {
+        id: 'jsonFilter',
+        type: 'QUERY_EXPRESSION',
+        name: 'Sub Sub Key',
+        expression: '`ResourceAttributesJSON`.`key2`.`subKey2`.`subSubKey2`',
+        source: 'logs',
+      },
+    ];
+
+    it('hydrates values for an already-backticked JSON sub-column path', () => {
+      const expression =
+        '`ResourceAttributesJSON`.`key2`.`subKey2`.`subSubKey2`';
+      const { result } = renderHook(() => useDashboardFilters(jsonPathFilters));
+
+      act(() => {
+        result.current.setFilterValue(expression, ['myValue']);
+      });
+
+      const { result: result2 } = renderHook(() =>
+        useDashboardFilters(jsonPathFilters),
+      );
+
+      // The selected value must populate under the original (backticked)
+      // expression key, despite parseQuery stripping the backticks.
+      expect(Object.keys(result2.current.filterValues)).toEqual([expression]);
+      expect(result2.current.filterValues[expression].included).toEqual(
+        new Set(['myValue']),
+      );
+      // It must not be reported as an ignored (undeclared) expression.
+      expect(result2.current.ignoredFilterExpressions).toEqual([]);
+      // The per-tile query wraps the already-quoted path in toString().
+      const tileQuery = result2.current.filterQueries[0];
+      const tileCondition = 'condition' in tileQuery ? tileQuery.condition : '';
+      expect(tileCondition).toBe(
+        "toString(`ResourceAttributesJSON`.`key2`.`subKey2`.`subSubKey2`) IN ('myValue')",
+      );
+    });
+
+    it('removes a value for an already-backticked JSON sub-column path', () => {
+      const expression =
+        '`ResourceAttributesJSON`.`key2`.`subKey2`.`subSubKey2`';
+      const { result } = renderHook(() => useDashboardFilters(jsonPathFilters));
+
+      act(() => {
+        result.current.setFilterValue(expression, ['myValue']);
+      });
+      act(() => {
+        result.current.setFilterValue(expression, []);
+      });
+
+      const { result: result2 } = renderHook(() =>
+        useDashboardFilters(jsonPathFilters),
+      );
+
+      expect(result2.current.filterValues[expression]).toBeUndefined();
+      expect(result2.current.filterQueries).toEqual([]);
+    });
+
+    it('replaces values for an already-backticked path without duplicating', () => {
+      const expression =
+        '`ResourceAttributesJSON`.`key2`.`subKey2`.`subSubKey2`';
+      const { result } = renderHook(() => useDashboardFilters(jsonPathFilters));
+
+      act(() => {
+        result.current.setFilterValue(expression, ['first']);
+      });
+      act(() => {
+        result.current.setFilterValue(expression, ['second']);
+      });
+
+      const { result: result2 } = renderHook(() =>
+        useDashboardFilters(jsonPathFilters),
+      );
+
+      // A single, replaced entry — not a stripped+backticked duplicate.
+      expect(result2.current.filterValues[expression].included).toEqual(
+        new Set(['second']),
+      );
+      expect(result2.current.filterQueries).toHaveLength(1);
+    });
+  });
+
   describe('ignoredFilterExpressions', () => {
     it('is empty when no URL filters are set', () => {
       const { result } = renderHook(() => useDashboardFilters(mockFilters));

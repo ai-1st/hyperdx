@@ -6,6 +6,7 @@ import {
 } from '@hyperdx/common-utils/dist/filters';
 import type { Filter } from '@hyperdx/common-utils/dist/types';
 
+import { toQuotedClickHouseKeyExpression } from './components/DBSearchPageFilters/utils';
 import { usePinnedFiltersApi, useUpdatePinnedFilters } from './pinnedFilters';
 import { useLocalStorage } from './utils';
 
@@ -354,6 +355,75 @@ export const parseQuery = (
   }
   return { filters: Object.fromEntries(state) };
 };
+
+// Rewrite the leading column key of a single filter condition produced by
+// `filtersToQuery` (`KEY IN (...)`, `KEY NOT IN (...)`, `KEY BETWEEN min AND
+// max`), conditionally backtick-quoting it for ClickHouse. Anything that isn't
+// one of these single-clause shapes (e.g. a source `tableFilterExpression`, or a
+// compound / comparison condition) is returned unchanged so we never mangle
+// arbitrary SQL.
+const rewriteFilterConditionKey = (
+  condition: string,
+  knownColumns: Set<string>,
+): string => {
+  const trimmed = condition.trim();
+
+  // BETWEEN: `KEY BETWEEN min AND max`
+  if (containsOutsideQuotes(trimmed, [' BETWEEN '])) {
+    const betweenMatch = trimmed.match(
+      /^(.+?)\s+BETWEEN\s+(.+?)\s+AND\s+(.+?)$/i,
+    );
+    if (betweenMatch) {
+      const [, key, minVal, maxVal] = betweenMatch;
+      const newKey = toQuotedClickHouseKeyExpression(key.trim(), knownColumns);
+      return `${newKey} BETWEEN ${minVal.trim()} AND ${maxVal.trim()}`;
+    }
+  }
+
+  // IN / NOT IN: skip parts carrying comparison/OR operators (not our shape).
+  if (!containsOperatorOutsideQuotes(trimmed)) {
+    const isExclude = containsOutsideQuotes(trimmed, [' NOT IN ']);
+    const hasIn = isExclude || containsOutsideQuotes(trimmed, [' IN ']);
+    if (hasIn) {
+      const splitResult = splitOnFirstOutsideQuotes(
+        trimmed,
+        isExclude ? ' NOT IN ' : ' IN ',
+      );
+      if (splitResult) {
+        const [key, values] = splitResult;
+        const newKey = toQuotedClickHouseKeyExpression(
+          key.trim(),
+          knownColumns,
+        );
+        return `${newKey}${isExclude ? ' NOT IN ' : ' IN '}${values.trim()}`;
+      }
+    }
+  }
+
+  return condition;
+};
+
+// Conditionally backtick-quote the column keys of search-page SQL filters at
+// query-generation time. The persisted `Filter[]` (URL state) keeps keys
+// unquoted; this only runs when handing filters to ClickHouse, and only quotes
+// identifiers that actually require it (e.g. `service-name`, not `ServiceName`).
+//
+// `knownColumns` (real top-level column names on the table) lets a key that is a
+// flat column whose name contains dots — e.g. a materialized column like
+// `__hdx_materialized_k8s.cluster.name` — be quoted as one identifier instead of
+// mis-parsed as Map/JSON sub-path access.
+export const escapeFilterKeysForSql = (
+  filters: Filter[],
+  knownColumns: Set<string>,
+): Filter[] =>
+  filters.map(filter =>
+    filter.type === 'sql'
+      ? {
+          ...filter,
+          condition: rewriteFilterConditionKey(filter.condition, knownColumns),
+        }
+      : filter,
+  );
 
 export const useSearchPageFilterState = ({
   searchQuery = [],

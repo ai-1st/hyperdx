@@ -57,8 +57,14 @@ describe('filters', () => {
         },
       };
       expect(filtersToQuery(filters, { stringifyKeys: true })).toEqual([
-        { type: 'sql', condition: "toString(json.key) IN ('value')" },
-        { type: 'sql', condition: "toString(json.key) NOT IN ('other value')" },
+        {
+          type: 'sql',
+          condition: "toString(json.key) IN ('value')",
+        },
+        {
+          type: 'sql',
+          condition: "toString(json.key) NOT IN ('other value')",
+        },
       ]);
     });
 
@@ -167,6 +173,107 @@ describe('filters', () => {
           condition: "message IN ('a\\\\''b')",
         },
       ]);
+    });
+
+    // `filtersToQuery` emits keys VERBATIM — it no longer backtick-escapes.
+    // Dashboard expressions must pass through unchanged, and search-page keys are
+    // conditionally quoted later (at SQL-generation time, via
+    // `escapeFilterKeysForSql`), so the persisted `Filter[]` / URL form stays
+    // free of identifier quoting.
+    describe('emits column identifiers verbatim', () => {
+      it('passes a hyphenated column name through unchanged (e.g. vpc-id)', () => {
+        const filters = {
+          'vpc-id': {
+            included: new Set<string>(['vpc-abc123']),
+            excluded: new Set<string>(),
+          },
+        };
+        expect(filtersToQuery(filters)).toEqual([
+          { type: 'sql', condition: "vpc-id IN ('vpc-abc123')" },
+        ]);
+      });
+
+      it('passes a hyphenated column through unchanged for excluded values too', () => {
+        const filters = {
+          'vpc-id': {
+            included: new Set<string>(),
+            excluded: new Set<string>(['vpc-abc123', 'vpc-def456']),
+          },
+        };
+        expect(filtersToQuery(filters)).toEqual([
+          {
+            type: 'sql',
+            condition: "vpc-id NOT IN ('vpc-abc123', 'vpc-def456')",
+          },
+        ]);
+      });
+
+      it('passes a hyphenated column through unchanged for BETWEEN range conditions', () => {
+        const filters = {
+          'response-time': {
+            included: new Set<string>(),
+            excluded: new Set<string>(),
+            range: { min: 100, max: 500 },
+          },
+        };
+        expect(filtersToQuery(filters)).toEqual([
+          { type: 'sql', condition: 'response-time BETWEEN 100 AND 500' },
+        ]);
+      });
+
+      it('only wraps the verbatim key in toString() when requested', () => {
+        const filters = {
+          'vpc-id': {
+            included: new Set<string>(['vpc-abc']),
+            excluded: new Set<string>(),
+          },
+        };
+        expect(filtersToQuery(filters, { stringifyKeys: true })).toEqual([
+          {
+            type: 'sql',
+            condition: "toString(vpc-id) IN ('vpc-abc')",
+          },
+        ]);
+      });
+
+      it('passes a column name containing a space through unchanged', () => {
+        const filters = {
+          'my column': {
+            included: new Set<string>(['value']),
+            excluded: new Set<string>(),
+          },
+        };
+        expect(filtersToQuery(filters)).toEqual([
+          { type: 'sql', condition: "my column IN ('value')" },
+        ]);
+      });
+
+      it('passes map/array bracket access through unchanged', () => {
+        const filters = {
+          "ResourceAttributes['k8s.pod-name']": {
+            included: new Set<string>(['checkout-0']),
+            excluded: new Set<string>(),
+          },
+        };
+        expect(filtersToQuery(filters)).toEqual([
+          {
+            type: 'sql',
+            condition: "ResourceAttributes['k8s.pod-name'] IN ('checkout-0')",
+          },
+        ]);
+      });
+
+      it('passes an already-backticked key through verbatim', () => {
+        const filters = {
+          '`vpc-id`': {
+            included: new Set<string>(['vpc-abc']),
+            excluded: new Set<string>(),
+          },
+        };
+        expect(filtersToQuery(filters)).toEqual([
+          { type: 'sql', condition: "`vpc-id` IN ('vpc-abc')" },
+        ]);
+      });
     });
   });
 
