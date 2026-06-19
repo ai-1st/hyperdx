@@ -76,6 +76,32 @@ router.post(
   handleAuthError,
 );
 
+// ===== OIDC / SSO (e.g. OneLogin) =====
+// Always-available config probe so the login page can decide whether to render
+// the SSO button (returns enabled:false when OIDC isn't configured).
+router.get('/sso/config', (_req, res) => {
+  res.json({
+    enabled: config.OIDC_ENABLED,
+    label: config.OIDC_BUTTON_LABEL,
+    loginPath: '/api/login/sso',
+  });
+});
+
+// Initiate + handle the OIDC flow. Routes are only mounted when SSO is
+// configured, so the stock image matches upstream until OIDC_* is set.
+if (config.OIDC_ENABLED) {
+  router.get('/login/sso', passport.authenticate('oidc'));
+
+  router.get(
+    '/auth/sso/callback',
+    passport.authenticate('oidc', {
+      failureRedirect: `${config.FRONTEND_REDIRECT_BASE}/login?err=ssoFail`,
+      failureMessage: true,
+    }),
+    redirectToDashboard,
+  );
+}
+
 router.post(
   '/register/password',
   validateRequest({ body: registrationSchema }),

@@ -1,4 +1,4 @@
-import { useEffect } from 'react';
+import { useEffect, useState } from 'react';
 import Link from 'next/link';
 import { useRouter } from 'next/router';
 import { NextSeo } from 'next-seo';
@@ -54,6 +54,27 @@ export default function AuthPage({ action }: { action: 'register' | 'login' }) {
 
   const { data: installation } = api.useInstallation();
   const registerPassword = api.useRegisterPassword();
+
+  // SSO (OIDC, e.g. OneLogin) — runtime-configured, so probe the API rather than
+  // a build-time flag. The button only renders when the server reports enabled.
+  const [ssoConfig, setSsoConfig] = useState<{
+    enabled: boolean;
+    label: string;
+    loginPath: string;
+  } | null>(null);
+  useEffect(() => {
+    if (action !== 'login') return;
+    let cancelled = false;
+    fetch('/api/sso/config')
+      .then(r => (r.ok ? r.json() : null))
+      .then(cfg => {
+        if (!cancelled) setSsoConfig(cfg);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [action]);
 
   const verificationSent = msg === 'verify';
 
@@ -217,6 +238,19 @@ export default function AuthPage({ action }: { action: 'register' | 'login' }) {
                 </Stack>
               </Paper>
 
+              {action === 'login' && ssoConfig?.enabled && (
+                <Button
+                  component="a"
+                  href={ssoConfig.loginPath}
+                  variant="default"
+                  size="md"
+                  fullWidth
+                  data-test-id="sso-login"
+                >
+                  {ssoConfig.label}
+                </Button>
+              )}
+
               {err != null && (
                 <Notification
                   withCloseButton={false}
@@ -234,7 +268,9 @@ export default function AuthPage({ action }: { action: 'register' | 'login' }) {
                           ? 'Password authentication is not allowed by your team admin.'
                           : err === 'teamAlreadyExists'
                             ? 'Team already exists, please login instead.'
-                            : 'Unknown error occurred, please try again later.'}
+                            : err === 'ssoFail'
+                              ? 'SSO sign-in failed or was not permitted. Please try again or use email and password.'
+                              : 'Unknown error occurred, please try again later.'}
                 </Notification>
               )}
 

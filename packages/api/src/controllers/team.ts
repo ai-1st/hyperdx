@@ -31,6 +31,16 @@ export async function isTeamExisting() {
   return teamCount > 0;
 }
 
+// The single team for this self-hosted instance (null if not bootstrapped yet).
+// Used by SSO JIT-provisioning to attach new users to the existing team.
+export function getDefaultTeam(): Promise<TeamDocument | null> {
+  if (config.IS_LOCAL_APP_MODE) {
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
+    return Promise.resolve(LOCAL_APP_TEAM as unknown as TeamDocument);
+  }
+  return Team.findOne({}).exec();
+}
+
 export async function createTeam({
   name,
   collectorAuthenticationEnforced = true,
