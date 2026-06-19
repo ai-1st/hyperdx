@@ -29,6 +29,45 @@ export const IS_INLINE_API = env.HDX_PREVIEW_INLINE_API === 'true';
 export const FRONTEND_REDIRECT_BASE = IS_INLINE_API ? '' : FRONTEND_URL;
 export const INGESTION_API_KEY = env.INGESTION_API_KEY ?? '';
 export const HYPERDX_API_KEY = env.HYPERDX_API_KEY as string;
+
+// ===== OIDC / SSO (e.g. OneLogin) =====
+// Optional. SSO is enabled only when issuer + authz/token endpoints + client
+// credentials + a callback URL are all present; otherwise the app behaves
+// exactly like upstream (password auth only). passport-openidconnect has no
+// discovery, so the endpoints are provided explicitly.
+export const OIDC_ISSUER = (env.OIDC_ISSUER ?? '') as string;
+export const OIDC_AUTHORIZATION_URL = (env.OIDC_AUTHORIZATION_URL ??
+  '') as string;
+export const OIDC_TOKEN_URL = (env.OIDC_TOKEN_URL ?? '') as string;
+export const OIDC_USERINFO_URL = (env.OIDC_USERINFO_URL ?? '') as string;
+export const OIDC_CLIENT_ID = (env.OIDC_CLIENT_ID ?? '') as string;
+export const OIDC_CLIENT_SECRET = (env.OIDC_CLIENT_SECRET ?? '') as string;
+// Where the IdP redirects the browser back to. Routed through the app's /api
+// proxy to the API's /auth/sso/callback. Override if your external host differs.
+export const OIDC_CALLBACK_URL = (env.OIDC_CALLBACK_URL ||
+  (FRONTEND_URL ? `${FRONTEND_URL}/api/auth/sso/callback` : '')) as string;
+export const OIDC_SCOPE = (env.OIDC_SCOPE ?? 'openid profile email') as string;
+export const OIDC_BUTTON_LABEL = (env.OIDC_BUTTON_LABEL ??
+  'Sign in with SSO') as string;
+// How the client authenticates at the token endpoint. Default 'client_secret_basic' (HTTP Basic) —
+// the OIDC-preferred method and what providers like OneLogin require. passport-openidconnect's
+// underlying node-oauth otherwise sends creds in the POST body ('client_secret_post'), which a
+// basic-configured app rejects with `invalid_client`. Set to 'client_secret_post' to use the library default.
+export const OIDC_TOKEN_AUTH_METHOD = (env.OIDC_TOKEN_AUTH_METHOD ??
+  'client_secret_basic') as 'client_secret_basic' | 'client_secret_post';
+// Optional comma-separated allowlist; when set, only these email domains may SSO in.
+export const OIDC_ALLOWED_EMAIL_DOMAINS = (env.OIDC_ALLOWED_EMAIL_DOMAINS ?? '')
+  .split(',')
+  .map(s => s.trim().toLowerCase())
+  .filter(Boolean);
+export const OIDC_ENABLED = Boolean(
+  OIDC_ISSUER &&
+    OIDC_AUTHORIZATION_URL &&
+    OIDC_TOKEN_URL &&
+    OIDC_CLIENT_ID &&
+    OIDC_CLIENT_SECRET &&
+    OIDC_CALLBACK_URL,
+);
 export const HYPERDX_LOG_LEVEL = env.HYPERDX_LOG_LEVEL as string;
 export const IS_CI = NODE_ENV === 'test';
 export const IS_DEV = NODE_ENV === 'development';
