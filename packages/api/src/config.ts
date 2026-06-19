@@ -49,6 +49,12 @@ export const OIDC_CALLBACK_URL = (env.OIDC_CALLBACK_URL ||
 export const OIDC_SCOPE = (env.OIDC_SCOPE ?? 'openid profile email') as string;
 export const OIDC_BUTTON_LABEL = (env.OIDC_BUTTON_LABEL ??
   'Sign in with SSO') as string;
+// How the client authenticates at the token endpoint. Default 'client_secret_basic' (HTTP Basic) —
+// the OIDC-preferred method and what providers like OneLogin require. passport-openidconnect's
+// underlying node-oauth otherwise sends creds in the POST body ('client_secret_post'), which a
+// basic-configured app rejects with `invalid_client`. Set to 'client_secret_post' to use the library default.
+export const OIDC_TOKEN_AUTH_METHOD = (env.OIDC_TOKEN_AUTH_METHOD ??
+  'client_secret_basic') as 'client_secret_basic' | 'client_secret_post';
 // Optional comma-separated allowlist; when set, only these email domains may SSO in.
 export const OIDC_ALLOWED_EMAIL_DOMAINS = (env.OIDC_ALLOWED_EMAIL_DOMAINS ?? '')
   .split(',')

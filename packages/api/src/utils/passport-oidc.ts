@@ -3,6 +3,8 @@
 // the stock image behaves exactly like upstream (password-only) until the
 // OIDC_* env vars are set. Users are JIT-provisioned into the team on first login,
 // mirroring the existing invite flow (routers/api/root.ts -> /team/setup/:token).
+import * as querystring from 'querystring';
+
 import { Strategy as OpenIDConnectStrategy } from 'passport-openidconnect';
 
 import * as config from '@/config';
@@ -63,8 +65,63 @@ function emailDomainAllowed(email: string): boolean {
   return domain != null && config.OIDC_ALLOWED_EMAIL_DOMAINS.includes(domain);
 }
 
+// passport-openidconnect 0.1.x (via node-oauth) authenticates the token request by putting
+// client_id/client_secret in the POST body (client_secret_post). Providers whose app is configured
+// for client_secret_basic (e.g. OneLogin) reject that with `invalid_client`. Override the token
+// request to send HTTP Basic and keep the creds out of the body. (No-op when OIDC_TOKEN_AUTH_METHOD
+// is 'client_secret_post' — the library default is used.)
+function applyClientSecretBasic(strategy: OpenIDConnectStrategy): void {
+  // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
+  const oauth2 = (strategy as any)._oauth2;
+  const basic =
+    'Basic ' +
+    Buffer.from(`${config.OIDC_CLIENT_ID}:${config.OIDC_CLIENT_SECRET}`).toString(
+      'base64',
+    );
+  oauth2.getOAuthAccessToken = function (
+    code: string,
+    params: Record<string, any>,
+    callback: (
+      err: any,
+      accessToken?: string,
+      refreshToken?: string,
+      results?: any,
+    ) => void,
+  ) {
+    const p: Record<string, any> = params || {};
+    const codeParam =
+      p.grant_type === 'refresh_token' ? 'refresh_token' : 'code';
+    p[codeParam] = code;
+    const postData = querystring.stringify(p);
+    const headers = {
+      'Content-Type': 'application/x-www-form-urlencoded',
+      Authorization: basic,
+    };
+    oauth2._request(
+      'POST',
+      oauth2._getAccessTokenUrl(),
+      headers,
+      postData,
+      null,
+      function (error: any, data: any) {
+        if (error) return callback(error);
+        let results: any;
+        try {
+          results = JSON.parse(data);
+        } catch (e) {
+          results = querystring.parse(data);
+        }
+        const accessToken = results.access_token;
+        const refreshToken = results.refresh_token;
+        delete results.refresh_token;
+        callback(null, accessToken, refreshToken, results);
+      },
+    );
+  };
+}
+
 export function buildOidcStrategy(): OpenIDConnectStrategy {
-  return new OpenIDConnectStrategy(
+  const strategy = new OpenIDConnectStrategy(
     {
       issuer: config.OIDC_ISSUER,
       authorizationURL: config.OIDC_AUTHORIZATION_URL,
@@ -107,4 +164,10 @@ export function buildOidcStrategy(): OpenIDConnectStrategy {
       }
     },
   );
+
+  if (config.OIDC_TOKEN_AUTH_METHOD === 'client_secret_basic') {
+    applyClientSecretBasic(strategy);
+  }
+
+  return strategy;
 }
