@@ -9,6 +9,71 @@
 
 ---
 
+# HyperDX with OpenID Connect (OIDC) Single Sign-On (SSO)
+
+> **This is a community fork of [HyperDX](https://github.com/hyperdxio/hyperdx) that adds optional
+> OpenID Connect (OIDC) Single Sign-On (SSO) login to self-hosted HyperDX** — so you can sign in to
+> your open-source [ClickStack](https://clickhouse.com/use-cases/observability) (ClickHouse +
+> HyperDX + OpenTelemetry) observability UI with your existing identity provider, without an
+> enterprise license. Everything else is unchanged from upstream (full upstream README below).
+
+## Self-hosted HyperDX SSO: OIDC / OpenID Connect single sign-on
+
+Self-hosted, open-source **HyperDX** ships with local email/password login only — native SSO is a
+paid enterprise feature. **This fork adds standards-based OpenID Connect (OIDC) single sign-on (SSO)
+authentication** as an opt-in login option *alongside* the built-in password auth, so teams can log
+in to their observability dashboards through a central identity provider (IdP) and single sign-on
+portal.
+
+**Compatible with any OpenID Connect / OAuth 2.0 identity provider**, including:
+**OneLogin**, **Okta**, **Microsoft Entra ID (Azure AD / Azure Active Directory)**, **Auth0**,
+**Keycloak**, **Google Workspace**, **Ping Identity (PingFederate / PingOne)**, **JumpCloud**,
+**Authentik**, **Authelia**, and other OIDC / SSO providers. (SSO here is implemented over the
+**OpenID Connect** protocol — a modern alternative to SAML; SAML is not included.)
+
+### What this SSO fork adds
+
+- 🔐 **OIDC / OpenID Connect single sign-on (SSO)** login for self-hosted HyperDX, built on
+  [Passport.js](https://www.passportjs.org/) (`passport-openidconnect`) — Authorization Code flow.
+- 👥 **Just-in-time (JIT) user provisioning** — first SSO login auto-creates the user and adds them
+  to the team (no manual user setup); access is gated by your IdP's app/role assignment.
+- 🔑 **`client_secret_basic` token-endpoint authentication** (configurable) — works with strict
+  providers like OneLogin that reject `client_secret_post`.
+- 🧩 **Additive & env-gated** — SSO turns on only when the `OIDC_*` environment variables are set;
+  with them unset the image behaves exactly like upstream HyperDX (password login). Same Docker
+  image, same ClickStack Helm chart — just point `hyperdx.image` at this build.
+- 🛡️ Optional **email-domain allowlist** for defense-in-depth on top of IdP role assignment.
+
+### Enabling SSO (environment variables)
+
+Set these on the HyperDX API/app container to enable OpenID Connect SSO (example values for
+OneLogin; works for Okta, Azure AD, Auth0, Keycloak, etc. — just swap the issuer/endpoints):
+
+```bash
+OIDC_ISSUER=https://<your-tenant>.onelogin.com/oidc/2
+OIDC_AUTHORIZATION_URL=https://<your-tenant>.onelogin.com/oidc/2/auth
+OIDC_TOKEN_URL=https://<your-tenant>.onelogin.com/oidc/2/token
+OIDC_USERINFO_URL=https://<your-tenant>.onelogin.com/oidc/2/me
+OIDC_CLIENT_ID=<oidc-app-client-id>
+OIDC_CLIENT_SECRET=<oidc-app-client-secret>      # store in a secret manager, never in git
+OIDC_CALLBACK_URL=https://<your-hyperdx-host>/api/auth/sso/callback
+OIDC_SCOPE="openid profile email"
+OIDC_TOKEN_AUTH_METHOD=client_secret_basic       # or client_secret_post
+# OIDC_ALLOWED_EMAIL_DOMAINS=example.com,corp.example.com   # optional allowlist
+```
+
+In your IdP, register an **OpenID Connect** application with the redirect / callback URL
+`https://<your-hyperdx-host>/api/auth/sso/callback`, scopes `openid profile email`, and assign the
+users/groups who should have access. A **"Sign in with SSO"** button then appears on the HyperDX
+login page, and `/api/login/sso` can be used as the IdP-initiated login URL.
+
+**Keywords:** HyperDX SSO, HyperDX OIDC, HyperDX OpenID Connect, self-hosted HyperDX single sign-on,
+ClickStack SSO, ClickHouse observability SSO, OpenTelemetry observability single sign-on, OneLogin
+HyperDX, Okta HyperDX, Azure AD / Entra ID HyperDX, Auth0 HyperDX, Keycloak HyperDX, Passport.js
+OIDC login, JIT user provisioning, enterprise SSO without license.
+
+---
+
 # HyperDX
 
 [HyperDX](https://hyperdx.io), a core component of
