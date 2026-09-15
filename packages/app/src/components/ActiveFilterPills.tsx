@@ -2,10 +2,10 @@ import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { BuilderChartConfigWithDateRange } from '@hyperdx/common-utils/dist/types';
 import {
   ActionIcon,
+  Autocomplete,
   Flex,
   FlexProps,
   Popover,
-  Select,
   Text,
   Tooltip,
 } from '@mantine/core';
@@ -20,6 +20,7 @@ import {
 
 import { useGetKeyValues } from '@/hooks/useMetadata';
 import type { FilterStateHook } from '@/searchFilters';
+import { useFormatTime } from '@/useFormatTime';
 import {
   CLIPBOARD_ERROR_MESSAGE,
   copyTextToClipboard,
@@ -29,15 +30,37 @@ const MAX_VISIBLE_PILLS = 8;
 // Cap the value list fetched for the in-pill value picker.
 const VALUE_EDIT_LIMIT = 50;
 
+// Stable identity so a caller that omits the prop doesn't invalidate the
+// flattenFilters useMemo on every render.
+const EMPTY_DATE_TIME_COLUMNS: ReadonlyMap<string, string> = new Map();
+
+type FormatTime = ReturnType<typeof useFormatTime>;
+
 type PillItem = {
   field: string;
   value: string;
   type: 'included' | 'excluded' | 'range';
   rawValue?: string | boolean;
+  // Display-only label for the pill (e.g. a DateTime value formatted to the
+  // user's locale/timezone). The raw `value`/`rawValue` are kept intact for
+  // SQL generation, value editing, copy, and the URL round-trip.
+  displayValue?: string;
 };
 
-function flattenFilters(filters: FilterStateHook['filters']): PillItem[] {
+function flattenFilters(
+  filters: FilterStateHook['filters'],
+  {
+    dateTimeColumns,
+    formatTime,
+  }: { dateTimeColumns: ReadonlyMap<string, string>; formatTime: FormatTime },
+): PillItem[] {
   const pills: PillItem[] = [];
+
+  const formatDisplayValue = (field: string, val: string | boolean) =>
+    dateTimeColumns.has(field) && typeof val === 'string'
+      ? formatTime(val, { format: 'withMs' })
+      : undefined;
+
   for (const [field, state] of Object.entries(filters)) {
     for (const val of state.included) {
       pills.push({
@@ -45,6 +68,7 @@ function flattenFilters(filters: FilterStateHook['filters']): PillItem[] {
         value: String(val),
         type: 'included',
         rawValue: val,
+        displayValue: formatDisplayValue(field, val),
       });
     }
     for (const val of state.excluded) {
@@ -53,6 +77,7 @@ function flattenFilters(filters: FilterStateHook['filters']): PillItem[] {
         value: String(val),
         type: 'excluded',
         rawValue: val,
+        displayValue: formatDisplayValue(field, val),
       });
     }
     if (state.range != null) {
@@ -108,11 +133,23 @@ function FilterPill({
 
   const [opened, setOpened] = useState(false);
   const [copied, setCopied] = useState(false);
+  // Draft of the value being typed in the picker. Free text is allowed (the
+  // field may not have this value in the sampled data yet), so we track what
+  // the user types and only commit it on submit/blur. It starts empty (the
+  // current value shows as a placeholder) so the full suggestion list is
+  // visible on open instead of being filtered down to just the current value.
+  const [draftValue, setDraftValue] = useState('');
   const copyTimerRef = useRef<ReturnType<typeof setTimeout>>(undefined);
 
   useEffect(() => {
     return () => clearTimeout(copyTimerRef.current);
   }, []);
+
+  // Reset the draft each time the menu opens so reopening on a different
+  // pill (or after a replace) starts from a clean, unfiltered list.
+  useEffect(() => {
+    setDraftValue('');
+  }, [pill.value, opened]);
 
   // The picker lists values to switch this pill to, so it must not be scoped
   // by the active query or by the pill's own filter. Reusing chartConfig
@@ -140,12 +177,23 @@ function FilterPill({
     [keyValues, pill.value],
   );
 
+  const label = pill.displayValue ?? pill.value;
   const tooltipLabel = isInvalid
     ? (invalidReason ??
       `Filter not applied: "${pill.field}" isn't a column on the current source. It will reapply if you switch back.`)
-    : `${pill.field}${operator}${pill.value}`;
+    : `${pill.field}${operator}${label}`;
 
   const showDangerAccent = isExcluded && !isInvalid;
+
+  // Commit the typed/picked value, but only when it actually differs from the
+  // current one (avoids a redundant query on blur with no change).
+  const commitValue = (value: string) => {
+    const trimmed = value.trim();
+    if (trimmed && trimmed !== pill.value) {
+      onReplaceValue(trimmed);
+    }
+    setOpened(false);
+  };
 
   const handleCopy = async () => {
     const ok = await copyTextToClipboard(pill.value);
@@ -218,7 +266,7 @@ function FilterPill({
           truncate
           style={{ textDecoration: isInvalid ? 'line-through' : undefined }}
         >
-          {pill.value}
+          {label}
         </Text>
         <ActionIcon
           size={14}
@@ -259,23 +307,39 @@ function FilterPill({
     >
       <Popover.Target>{pillWithTooltip}</Popover.Target>
       <Popover.Dropdown p={6}>
-        <Select
+        <Autocomplete
           size="xs"
           w={220}
-          searchable
           mb={6}
           data={valueOptions}
-          value={pill.value}
-          onChange={value => {
-            if (value && value !== pill.value) {
-              onReplaceValue(value);
-              setOpened(false);
+          value={draftValue}
+          onChange={setDraftValue}
+          // Picking a suggestion commits immediately.
+          onOptionSubmit={commitValue}
+          onKeyDown={e => {
+            if (e.key !== 'Enter') {
+              return;
+            }
+            // If the user is keyboard-navigating the dropdown, an option is
+            // highlighted (Mantine marks it with [data-combobox-selected]).
+            // Let the combobox handle Enter natively so it submits that option
+            // via onOptionSubmit. Only commit free text when no option is
+            // highlighted, so a typed value not in the list still applies.
+            // Scope the lookup to this input's own listbox (via aria-controls)
+            // rather than the whole document, so another open combobox on the
+            // page can't make us swallow Enter here.
+            const listId = e.currentTarget.getAttribute('aria-controls');
+            const list = listId ? document.getElementById(listId) : null;
+            const hasHighlightedOption = !!list?.querySelector(
+              '[data-combobox-selected]',
+            );
+            if (!hasHighlightedOption) {
+              e.preventDefault();
+              commitValue(draftValue);
             }
           }}
           comboboxProps={{ withinPortal: false }}
-          nothingFoundMessage={
-            isFetchingValues ? 'Loading values...' : 'No values'
-          }
+          placeholder={isFetchingValues ? 'Loading values...' : pill.value}
           aria-label="Change filter value"
         />
         <Flex gap={4} align="center">
@@ -319,9 +383,16 @@ export const ActiveFilterPills = memo(function ActiveFilterPills({
   invalidFields,
   invalidFieldReason,
   chartConfig,
+  dateTimeColumns = EMPTY_DATE_TIME_COLUMNS,
   ...flexProps
 }: {
   searchFilters: FilterStateHook;
+  /**
+   * Map of DateTime/Date column name → ClickHouse type. Their pill values are
+   * formatted to the user's locale/timezone for display, matching the results
+   * table, while the underlying raw value is preserved for SQL/editing/copy.
+   */
+  dateTimeColumns?: ReadonlyMap<string, string>;
   /**
    * Field names whose filters are present in state but not applied to the
    * current query (e.g. column doesn't exist on the active source). These
@@ -348,7 +419,11 @@ export const ActiveFilterPills = memo(function ActiveFilterPills({
     clearAllFilters,
   } = searchFilters;
 
-  const pills = useMemo(() => flattenFilters(filters), [filters]);
+  const formatTime = useFormatTime();
+  const pills = useMemo(
+    () => flattenFilters(filters, { dateTimeColumns, formatTime }),
+    [filters, dateTimeColumns, formatTime],
+  );
   const [expanded, setExpanded] = useState(false);
   const [confirmClear, setConfirmClear] = useState(false);
   const confirmTimerRef = useRef<ReturnType<typeof setTimeout>>(undefined);

@@ -1,14 +1,20 @@
+import { useCallback } from 'react';
 import Router from 'next/router';
 import type { HTTPError, Options, ResponsePromise } from 'ky';
 import ky from 'ky-universal';
 import type {
   Alert,
   AlertApiResponse,
+  AlertEvaluationsApiResponse,
+  AlertHistoryRangeApiResponse,
   AlertsApiResponse,
   InstallationApiResponse,
   MeApiResponse,
+  OnboardingDataApiResponse,
+  OnboardingTaskId,
   PresetDashboard,
   PresetDashboardFilter,
+  RotateAccessKeyApiResponse,
   RotateApiKeyApiResponse,
   TeamApiResponse,
   TeamClickHouseSettingsUpdate,
@@ -21,7 +27,12 @@ import type {
   WebhookTestApiResponse,
   WebhookUpdateApiResponse,
 } from '@hyperdx/common-utils/dist/types';
-import { useMutation, useQuery } from '@tanstack/react-query';
+import {
+  useInfiniteQuery,
+  useMutation,
+  useQuery,
+  useQueryClient,
+} from '@tanstack/react-query';
 
 import { IS_LOCAL_MODE } from './config';
 import { getLocalDashboardTags } from './dashboard';
@@ -75,23 +86,105 @@ export const hdxServer = (
   });
 };
 
+// Standalone export so other mutation hooks in this file can compose it.
+export function useCompleteOnboardingTask() {
+  const queryClient = useQueryClient();
+  return useMutation<
+    OnboardingDataApiResponse,
+    Error | HTTPError,
+    OnboardingTaskId
+  >({
+    mutationFn: async (taskId: OnboardingTaskId) =>
+      hdxServer('me/onboarding/task', {
+        method: 'POST',
+        json: { taskId },
+      }).json<OnboardingDataApiResponse>(),
+    onSuccess: data => {
+      // Union completedTasks (not replace) so an out-of-order response can't
+      // drop a newer task; keep isDismissed from the cache since a concurrent
+      // dismiss's state isn't reflected in this response.
+      queryClient.setQueryData<MeApiResponse | null>(['me'], prev => {
+        if (prev?.onboardingData == null) {
+          return prev == null
+            ? prev
+            : { ...prev, onboardingData: data.onboardingData };
+        }
+        const merged = new Set([
+          ...prev.onboardingData.completedTasks,
+          ...data.onboardingData.completedTasks,
+        ]);
+        return {
+          ...prev,
+          onboardingData: {
+            ...prev.onboardingData,
+            completedTasks: [...merged],
+          },
+        };
+      });
+    },
+  });
+}
+
+// Patches the `me` cache in place (no request, no invalidation) after the
+// backend has already recorded a task server-side. Invalidating `['me']` would
+// refetch for every useMe consumer (metadata, clickhouse settings, AppNav) for
+// a change only the sidebar cares about.
+export function useMarkOnboardingTaskComplete() {
+  const queryClient = useQueryClient();
+  return useCallback(
+    (taskId: OnboardingTaskId) => {
+      queryClient.setQueryData<MeApiResponse | null>(['me'], prev => {
+        // `?.`: this runs in dashboard/alert mutation onSuccess, and a throw
+        // would flip a succeeded save to "Unable to save".
+        if (prev?.onboardingData == null) {
+          return prev;
+        }
+        if (prev.onboardingData.completedTasks.includes(taskId)) {
+          return prev;
+        }
+        return {
+          ...prev,
+          onboardingData: {
+            ...prev.onboardingData,
+            completedTasks: [...prev.onboardingData.completedTasks, taskId],
+          },
+        };
+      });
+    },
+    [queryClient],
+  );
+}
+
 const api = {
   useCreateAlert() {
+    const markOnboardingTaskComplete = useMarkOnboardingTaskComplete();
     return useMutation<{ data: Alert }, Error, Alert>({
       mutationFn: async alert =>
         server('alerts', {
           method: 'POST',
           json: alert,
         }).json(),
+      // Backend records the task; just sync the cache.
+      onSuccess: () => {
+        if (!IS_LOCAL_MODE) {
+          markOnboardingTaskComplete('alert');
+        }
+      },
     });
   },
   useUpdateAlert() {
+    const markOnboardingTaskComplete = useMarkOnboardingTaskComplete();
     return useMutation<{ data: Alert }, Error, { id: string } & Alert>({
       mutationFn: async alert =>
         server(`alerts/${alert.id}`, {
           method: 'PUT',
           json: alert,
         }).json(),
+      onSuccess: () => {
+        if (!IS_LOCAL_MODE) {
+          markOnboardingTaskComplete('alert');
+        }
+      },
     });
   },
   useDeleteAlert() {
@@ -189,6 +282,67 @@ const api = {
       enabled: alertId != null,
     });
   },
+  getAlertHistoryQueryKey: (
+    alertId: string | undefined,
+    startTime: number,
+    endTime: number,
+  ) => ['alertHistory', alertId, startTime, endTime] as const,
+  // Fetches alert firing/recovery transitions within a time range, for drawing
+  // annotations on dashboard charts. Bounds are quantized to the minute so a
+  // live/auto-refreshing dashboard doesn't produce a new query key (and refetch
+  // every alerted tile) on every sub-minute tick.
+  useAlertHistory(
+    alertId: string | undefined,
+    dateRange: [Date, Date],
+    { enabled = true }: { enabled?: boolean } = {},
+  ) {
+    const BUCKET_MS = 60_000;
+    const startTime =
+      Math.floor(dateRange[0].getTime() / BUCKET_MS) * BUCKET_MS;
+    const endTime = Math.floor(dateRange[1].getTime() / BUCKET_MS) * BUCKET_MS;
+    return useQuery({
+      queryKey: api.getAlertHistoryQueryKey(alertId, startTime, endTime),
+      queryFn: () =>
+        hdxServer(`alerts/${alertId}/history`, {
+          method: 'GET',
+          searchParams: { startTime, endTime },
+        }).json<AlertHistoryRangeApiResponse>(),
+      enabled: enabled && alertId != null,
+    });
+  },
+  getAlertEvaluationsQueryKey: (
+    alertId: string | undefined,
+    startTime: number,
+    endTime: number,
+  ) => ['alertEvaluations', alertId, startTime, endTime] as const,
+  // Paginated evaluation history for the alert detail page: one entry per
+  // evaluation window (newest first), scoped to the given date range and
+  // including errors recorded for each window. Older pages are keyed off the
+  // server-provided `nextBefore` cursor, which advances even across gaps with
+  // no evaluations. Bounds are quantized to the minute so live ticks don't
+  // produce a new query key on every render.
+  useAlertEvaluations(alertId: string | undefined, dateRange: [Date, Date]) {
+    const BUCKET_MS = 60_000;
+    const startTime =
+      Math.floor(dateRange[0].getTime() / BUCKET_MS) * BUCKET_MS;
+    const endTime = Math.floor(dateRange[1].getTime() / BUCKET_MS) * BUCKET_MS;
+    return useInfiniteQuery({
+      queryKey: api.getAlertEvaluationsQueryKey(alertId, startTime, endTime),
+      queryFn: ({ pageParam }) =>
+        hdxServer(`alerts/${alertId}/evaluations`, {
+          method: 'GET',
+          searchParams: {
+            startTime,
+            endTime,
+            ...(pageParam != null && { before: pageParam }),
+          },
+        }).json<AlertEvaluationsApiResponse>(),
+      initialPageParam: undefined as number | undefined,
+      getNextPageParam: lastPage =>
+        lastPage.hasMore ? lastPage.nextBefore : undefined,
+      enabled: alertId != null && startTime < endTime,
+    });
+  },
   useServices() {
     return useQuery({
       queryKey: [`services`],
@@ -204,6 +358,41 @@ const api = {
         hdxServer(`team/apiKey`, {
           method: 'PATCH',
         }).json<RotateApiKeyApiResponse>(),
+    });
+  },
+  useRotatePersonalAccessKey() {
+    const queryClient = useQueryClient();
+    return useMutation<RotateAccessKeyApiResponse, Error | HTTPError>({
+      mutationFn: async () =>
+        hdxServer(`me/accessKey`, {
+          method: 'PATCH',
+        }).json<RotateAccessKeyApiResponse>(),
+      // Seed the cache from the response rather than refetching `me`. The old
+      // key is already revoked by the time this runs, so a refetch that fails
+      // would leave every `useMe` consumer rendering a dead credential with no
+      // way to reach the new one short of a reload.
+      onSuccess: data => {
+        queryClient.setQueryData<MeApiResponse | null>(['me'], prev =>
+          prev == null ? prev : { ...prev, accessKey: data.newAccessKey },
+        );
+      },
+    });
+  },
+  useDismissOnboarding() {
+    const queryClient = useQueryClient();
+    return useMutation<OnboardingDataApiResponse, Error | HTTPError, boolean>({
+      mutationFn: async (isDismissed: boolean) =>
+        hdxServer('me/onboarding/dismiss', {
+          method: 'PATCH',
+          json: { isDismissed },
+        }).json<OnboardingDataApiResponse>(),
+      onSuccess: data => {
+        queryClient.setQueryData<MeApiResponse | null>(['me'], prev =>
+          prev == null
+            ? prev
+            : { ...prev, onboardingData: data.onboardingData },
+        );
+      },
     });
   },
   useDeleteTeamMember() {
@@ -504,18 +693,16 @@ type PrometheusQueryRangeResponse = {
   };
   error?: string;
 };
-type PrometheusLabelValuesResponse = {
+type PrometheusLabelsResponse = {
   status: 'success' | 'error';
   data?: string[];
   error?: string;
 };
 
-async function prometheusFetch<T>(
-  path: string,
-  searchParams: Record<string, string>,
-): Promise<T> {
+/** Reports the reason a Prometheus-shaped error body carries, not ky's. */
+async function withPrometheusError<T>(request: () => Promise<T>): Promise<T> {
   try {
-    return await server.post(path, { searchParams }).json();
+    return await request();
   } catch (e: any) {
     // ky throws HTTPError on non-2xx — read the response body for the real error
     if (e?.response) {
@@ -534,6 +721,21 @@ async function prometheusFetch<T>(
   }
 }
 
+/**
+ * Some Prometheus backends return the same label name or value more than once,
+ * de-dupe to prevent any duplicate option errors downstream.
+ */
+const uniqueLabels = (
+  resp: PrometheusLabelsResponse,
+): PrometheusLabelsResponse =>
+  resp.data ? { ...resp, data: [...new Set(resp.data)] } : resp;
+
+const prometheusFetch = <T>(
+  path: string,
+  searchParams: Record<string, string>,
+): Promise<T> =>
+  withPrometheusError(() => server.post(path, { searchParams }).json<T>());
+
 export const prometheusApi = {
   queryRange: (params: {
     query: string;
@@ -541,8 +743,8 @@ export const prometheusApi = {
     end: number;
     step: string;
     connectionId: string;
-    database: string;
-    table: string;
+    database?: string;
+    table?: string;
   }): Promise<PrometheusQueryRangeResponse> =>
     prometheusFetch('v1/prometheus/query_range', {
       query: params.query,
@@ -550,23 +752,57 @@ export const prometheusApi = {
       end: String(params.end),
       step: params.step,
       connectionId: params.connectionId,
-      database: params.database,
-      table: params.table,
+      ...(params.database ? { database: params.database } : {}),
+      ...(params.table ? { table: params.table } : {}),
     }),
+
+  labels: (params: {
+    connectionId: string;
+    database?: string;
+    table?: string;
+    start?: number;
+    end?: number;
+  }): Promise<PrometheusLabelsResponse> =>
+    server
+      .get('v1/prometheus/labels', {
+        searchParams: labelLookupSearchParams(params),
+      })
+      .json<PrometheusLabelsResponse>()
+      .then(uniqueLabels),
 
   labelValues: (params: {
     label: string;
     connectionId: string;
     database?: string;
     table?: string;
-  }): Promise<PrometheusLabelValuesResponse> =>
-    server
-      .get(`v1/prometheus/label/${params.label}/values`, {
-        searchParams: {
-          connectionId: params.connectionId,
-          ...(params.database ? { database: params.database } : {}),
-          ...(params.table ? { table: params.table } : {}),
-        },
-      })
-      .json(),
+    start?: number;
+    end?: number;
+    match?: string;
+  }): Promise<PrometheusLabelsResponse> =>
+    withPrometheusError(() =>
+      server
+        .get(`v1/prometheus/label/${params.label}/values`, {
+          searchParams: labelLookupSearchParams(params),
+        })
+        .json<PrometheusLabelsResponse>()
+        .then(uniqueLabels),
+    ),
 };
+
+function labelLookupSearchParams(params: {
+  connectionId: string;
+  database?: string;
+  table?: string;
+  start?: number;
+  end?: number;
+  match?: string;
+}): Record<string, string> {
+  return {
+    connectionId: params.connectionId,
+    ...(params.database ? { database: params.database } : {}),
+    ...(params.table ? { table: params.table } : {}),
+    ...(params.start != null ? { start: String(params.start) } : {}),
+    ...(params.end != null ? { end: String(params.end) } : {}),
+    ...(params.match ? { 'match[]': params.match } : {}),
+  };
+}

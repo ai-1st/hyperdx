@@ -1,8 +1,10 @@
-import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { hasVariableMacro } from '@hyperdx/common-utils/dist/variables';
 import { z } from 'zod';
 
-import { withToolTracing } from '../../utils/tracing';
-import type { McpContext } from '../types';
+import type { ToolRegistrar } from '@/mcp/tools/types';
+import { mcpUserError } from '@/mcp/utils/errors';
+
+import { BUILDER_TOOLS_LIST, SQL_FALLBACK_CRITERIA } from './builderCatalog';
 import { buildTile, parseTimeRange, runConfigTile } from './helpers';
 import { endTimeSchema, startTimeSchema } from './schemas';
 
@@ -52,35 +54,51 @@ const sqlSchema = z.object({
 
 // ─── Tool registration ───────────────────────────────────────────────────────
 
-export function registerSql(server: McpServer, context: McpContext) {
+export function registerSql({ context, registerTool }: ToolRegistrar) {
   const { teamId } = context;
 
-  server.registerTool(
+  registerTool(
     'clickstack_sql',
     {
       title: 'Raw SQL Query',
+      // Enforces ClickHouse readonly=2, so effectively read-only.
+      annotations: { readOnlyHint: true },
       description:
-        'Execute raw ClickHouse SQL. ' +
-        'ADVANCED: only use this when you need capabilities the builder tools cannot express — ' +
-        'JOINs, sub-queries, CTEs, or querying tables not registered as sources.\n\n' +
+        'Execute raw ClickHouse SQL. LAST-RESORT TOOL — do NOT reach for this first.\n\n' +
+        'Default to the builder tools for querying; they are more reliable and produce ' +
+        'richer, structured results:\n' +
+        BUILDER_TOOLS_LIST +
+        '\n\n' +
+        'ONLY use raw SQL when the query genuinely cannot be expressed by a builder tool — ' +
+        `i.e. it requires ${SQL_FALLBACK_CRITERIA}. ` +
+        'A single-table aggregation, top-N, time-series, or row browse is ALWAYS a ' +
+        'builder-tool job, never raw SQL. If you are unsure, try the builder tool first and only ' +
+        'fall back to SQL if it cannot express what you need.\n\n' +
         'Requires connectionId (not sourceId) — call clickstack_list_sources to find connections. ' +
         'Call clickstack_describe_source to discover column names before writing SQL.\n\n' +
         'Results are always returned as table rows — for time-series semantics, ' +
-        'include a time column and ORDER BY it in your SQL.\n\n' +
-        'For standard aggregations use clickstack_table. ' +
-        'For time-series charts use clickstack_timeseries. ' +
-        'For browsing rows use clickstack_search.',
+        'include a time column and ORDER BY it in your SQL.',
       inputSchema: sqlSchema,
     },
-    withToolTracing('clickstack_sql', context, async input => {
+    async input => {
       const timeRange = parseTimeRange(input.startTime, input.endTime);
       if ('error' in timeRange) {
-        return {
-          isError: true,
-          content: [{ type: 'text' as const, text: timeRange.error }],
-        };
+        return mcpUserError(timeRange.error);
       }
       const { startDate, endDate } = timeRange;
+
+      // $__filter / $__conditionalAll read the variables a dashboard's filters
+      // declare, and this tool has no dashboard behind it.
+      if (hasVariableMacro(input.sql)) {
+        return mcpUserError(
+          'The $__filter and $__conditionalAll macros only resolve for a tile ' +
+            'on a dashboard, because they read the dashboard variables its ' +
+            'filters declare. This tool has no dashboard, so they would be ' +
+            'sent to ClickHouse as literal text. Inline the condition here, ' +
+            'or save the query as a dashboard tile and validate it with ' +
+            'clickstack_query_tile.',
+        );
+      }
 
       const tile = buildTile('MCP SQL', 24, 6, {
         configType: 'sql' as const,
@@ -90,6 +108,6 @@ export function registerSql(server: McpServer, context: McpContext) {
       });
 
       return runConfigTile(teamId.toString(), tile, startDate, endDate);
-    }),
+    },
   );
 }

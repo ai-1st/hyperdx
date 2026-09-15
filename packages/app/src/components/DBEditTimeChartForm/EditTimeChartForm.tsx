@@ -15,11 +15,15 @@ import {
 import { isRawSqlSavedChartConfig } from '@hyperdx/common-utils/dist/guards';
 import {
   ChartConfigWithDateRange,
+  ChartVariable,
+  DashboardFilter,
   DisplayType,
+  Filter,
   SavedChartConfig,
   SourceKind,
   TSource,
 } from '@hyperdx/common-utils/dist/types';
+import { getAlertVariableWarning } from '@hyperdx/common-utils/dist/variables';
 import {
   Box,
   Divider,
@@ -29,9 +33,11 @@ import {
   Text,
   Textarea,
 } from '@mantine/core';
-import { useDisclosure, usePrevious } from '@mantine/hooks';
+import { useDebouncedValue, useDisclosure, usePrevious } from '@mantine/hooks';
 import { notifications } from '@mantine/notifications';
 import {
+  IconBracketsContain,
+  IconChartBar,
   IconChartLine,
   IconChartPie,
   IconGrid3x3,
@@ -55,7 +61,9 @@ import {
   convertFormStateToChartConfig,
   convertFormStateToSavedChartConfig,
   convertSavedChartConfigToFormState,
+  isPromqlDisplayType,
   isRawSqlDisplayType,
+  isStringSelectDisplayType,
   validateChartForm,
 } from '@/components/ChartEditor/utils';
 import type { HeatmapScaleType } from '@/components/DBHeatmapChart';
@@ -75,14 +83,16 @@ import {
 } from '@/source';
 import { normalizeNoOpAlertScheduleFields } from '@/utils/alerts';
 
-import { ChartActionBar } from './ChartActionBar';
+import { ChartActionBar, DashboardFiltersToggleProps } from './ChartActionBar';
 import { ChartEditorControls } from './ChartEditorControls';
 import { ChartPreviewPanel } from './ChartPreviewPanel';
 import { ErrorNotificationMessage } from './ErrorNotificationMessage';
+import { useBuilderToSqlConversion } from './useBuilderToSqlConversion';
 import {
   buildChartConfigForExplanations,
   computeDbTimeChartConfig,
   displayTypeToActiveTab,
+  resolveTilePreviewFilters,
   TABS_WITH_GENERATED_SQL,
   zSavedChartConfig,
 } from './utils';
@@ -90,6 +100,12 @@ import {
 type EditTimeChartFormProps = {
   dashboardId?: string;
   chartConfig: SavedChartConfig;
+  /** Variables and their selected values, from the parent dashboard (if one exists). */
+  variables?: ChartVariable[];
+  /** Function returning the dashboard's broadcast filters for the given source, if any. */
+  getDashboardFilters?: (sourceId: string | undefined) => Filter[];
+  /** The dashboard's required filters that have nothing selected, if any */
+  unsatisfiedRequiredFilters?: DashboardFilter[];
   displayedTimeInputValue?: string;
   dateRange: [Date, Date];
   isSaving?: boolean;
@@ -104,7 +120,30 @@ type EditTimeChartFormProps = {
   submitRef?: React.MutableRefObject<(() => void) | undefined>;
   isDashboardForm?: boolean;
   autoRun?: boolean;
+  /**
+   * Whether the editor offers an alert. Defaults to "inside a dashboard",
+   * which is where tile alerts live; the chart explorer and the inline-alert
+   * editor opt in explicitly (their alerts persist on the alert document
+   * rather than on a tile).
+   */
+  enableAlerts?: boolean;
+  /**
+   * Save the chart's alert on its own, without a dashboard tile behind it
+   * (an inline alert). Renders a save button in the action bar; the config
+   * handed over still carries `alert`, so the caller splits it.
+   */
+  onSaveAlert?: (chart: SavedChartConfig) => void;
+  /** Label for the alert save button, e.g. "Create alert" vs "Save alert". */
+  saveAlertLabel?: string;
+  isSavingAlert?: boolean;
+  /** Hides the alert editor's remove control, for surfaces that require one. */
+  isAlertRequired?: boolean;
+  /** Whether to offer "Save to dashboard". Defaults to "outside a dashboard". */
+  showSaveToDashboard?: boolean;
 };
+
+const ALERT_IGNORES_DASHBOARD_FILTERS =
+  'Dashboard-level filter and variable selections cannot be applied when an alert is configured.';
 
 /** Populate form state with the standard heatmap series + duration numberFormat. */
 function applyHeatmapDefaults(
@@ -128,6 +167,9 @@ function applyHeatmapDefaults(
 export default function EditTimeChartForm({
   dashboardId,
   chartConfig,
+  variables,
+  getDashboardFilters,
+  unsatisfiedRequiredFilters,
   displayedTimeInputValue,
   dateRange,
   isSaving,
@@ -142,7 +184,14 @@ export default function EditTimeChartForm({
   submitRef,
   isDashboardForm = false,
   autoRun = false,
+  enableAlerts,
+  onSaveAlert,
+  saveAlertLabel,
+  isSavingAlert,
+  isAlertRequired = false,
+  showSaveToDashboard,
 }: EditTimeChartFormProps) {
+  const alertsEnabled = enableAlerts ?? dashboardId != null;
   const formValue: ChartEditorFormState = useMemo(
     () => convertSavedChartConfigToFormState(chartConfig),
     [chartConfig],
@@ -152,6 +201,10 @@ export default function EditTimeChartForm({
     control,
     setValue,
     getValues,
+    // The callback form of `watch` is used to subscribe to field changes
+    // (without re-rendering) in useBuilderToSqlConversion; useWatch can't do this.
+    // eslint-disable-next-line react-hook-form/no-use-watch
+    watch,
     handleSubmit,
     register,
     setError,
@@ -191,14 +244,23 @@ export default function EditTimeChartForm({
     [insertSeries, getValues],
   );
 
+  // Track whether sub-form changes (display settings, heatmap settings) have
+  // been applied. These bypass RHF's dirty tracking, so we latch here: once
+  // set, only a parent reset (new tile opened) clears it via onDirtyChange.
+  const subFormDirtyRef = useRef(false);
+
   useEffect(() => {
-    onDirtyChange?.(isDirty);
+    // Don't let RHF's isDirty=false clear the flag after sub-form changes
+    // were applied (RHF resets isDirty when its `values` prop re-syncs).
+    onDirtyChange?.(isDirty || subFormDirtyRef.current);
   }, [isDirty, onDirtyChange]);
 
   const select = useWatch({ control, name: 'select' });
+  const series = useWatch({ control, name: 'series' });
   const sourceId = useWatch({ control, name: 'source' });
   const alert = useWatch({ control, name: 'alert' });
   const seriesReturnType = useWatch({ control, name: 'seriesReturnType' });
+  const ratioMode = useWatch({ control, name: 'ratioMode' });
   const groupBy = useWatch({ control, name: 'groupBy' });
   const displayType =
     useWatch({ control, name: 'displayType' }) ?? DisplayType.Line;
@@ -209,11 +271,21 @@ export default function EditTimeChartForm({
   const chartConfigAlert = chartConfig.alert;
   const isRawSqlInput =
     configType === 'sql' && isRawSqlDisplayType(displayType);
-  const isPromqlInput = configType === 'promql';
+  const isPromqlInput =
+    configType === 'promql' && isPromqlDisplayType(displayType);
 
   const { data: tableSource } = useSource({ id: sourceId });
   const databaseName = tableSource?.from.databaseName;
   const tableName = tableSource?.from.tableName;
+
+  // Carry the builder config over as a SQL template when switching to SQL mode
+  useBuilderToSqlConversion({
+    control,
+    getValues,
+    setValue,
+    watch,
+    tableSource,
+  });
 
   const activeTab = displayTypeToActiveTab(displayType);
 
@@ -243,9 +315,12 @@ export default function EditTimeChartForm({
     fitYAxisToData,
     numberFormat,
     groupByColumnsOnLeft,
+    alternateRowBackground,
     seriesLimit,
     color,
     colorRules,
+    backgroundChart,
+    legendTemplate,
   ] = useWatch({
     control,
     name: [
@@ -255,19 +330,27 @@ export default function EditTimeChartForm({
       'fitYAxisToData',
       'numberFormat',
       'groupByColumnsOnLeft',
+      'alternateRowBackground',
       'seriesLimit',
       'color',
       'colorRules',
+      'backgroundChart',
+      'legendTemplate',
     ],
   });
 
+  // Format auto-detected purely from the datasource (e.g. duration for a trace
+  // Duration column), used as the drawer's fallback when no explicit
+  // numberFormat is set. Reads the live `series`, the field the builder edits;
+  // `select` is only synced from `series` on submit and on display-type / source
+  // resets, so it goes stale after an aggregation edit and resolves undefined.
+  // The drawer prioritizes an explicit `numberFormat` over this fallback.
   const autoDetectedNumberFormat = useMemo(
     () =>
-      numberFormat ??
-      (Array.isArray(select)
-        ? getFirstSeriesNumberFormat(select, tableSource)
-        : undefined),
-    [numberFormat, select, tableSource],
+      Array.isArray(series)
+        ? getFirstSeriesNumberFormat(series, tableSource)
+        : undefined,
+    [series, tableSource],
   );
 
   const displaySettings: ChartConfigDisplaySettings = useMemo(
@@ -278,9 +361,12 @@ export default function EditTimeChartForm({
       fitYAxisToData,
       numberFormat,
       groupByColumnsOnLeft,
+      alternateRowBackground,
       seriesLimit,
       color,
       colorRules,
+      backgroundChart,
+      legendTemplate,
     }),
     [
       alignDateRangeToGranularity,
@@ -289,9 +375,12 @@ export default function EditTimeChartForm({
       fitYAxisToData,
       numberFormat,
       groupByColumnsOnLeft,
+      alternateRowBackground,
       seriesLimit,
       color,
       colorRules,
+      backgroundChart,
+      legendTemplate,
     ],
   );
 
@@ -323,17 +412,94 @@ export default function EditTimeChartForm({
     [],
   );
 
-  const dbTimeChartConfig = useMemo(
-    () => computeDbTimeChartConfig(queriedConfig, alert),
-    [queriedConfig, alert],
+  // Alerts ignore dashboard-level filters and variables,
+  // so disable the toggle when an alert is configured.
+  const [applyFilters, setApplyFilters] = useState(true);
+  const resolvedApplyFilters = applyFilters && alert == null;
+
+  const dashboardFiltersToggleProps = useMemo<
+    DashboardFiltersToggleProps | undefined
+  >(
+    () =>
+      getDashboardFilters == null
+        ? undefined
+        : {
+            checked: resolvedApplyFilters,
+            disabledReason:
+              alert != null ? ALERT_IGNORES_DASHBOARD_FILTERS : undefined,
+            onChange: setApplyFilters,
+          },
+    [getDashboardFilters, resolvedApplyFilters, alert],
   );
+
+  const previewDashboardFilters = useMemo(() => {
+    if (queriedConfig == null) {
+      return undefined;
+    }
+    // The submitted config carries the source it was built against. Resolving
+    // against that rather than the live selection keeps the filters consistent
+    // with the query on screen when the source is changed without a re-run.
+    const queriedSourceId = queriedConfig.source || undefined;
+
+    return resolveTilePreviewFilters({
+      config: queriedConfig,
+      sourceId: queriedSourceId,
+      filters: getDashboardFilters?.(queriedSourceId),
+      variables,
+      unsatisfiedRequiredFilters,
+      applySelections: resolvedApplyFilters,
+    });
+  }, [
+    queriedConfig,
+    getDashboardFilters,
+    variables,
+    unsatisfiedRequiredFilters,
+    resolvedApplyFilters,
+  ]);
+
+  // Attach the dashboard's filters and variables so that the preview queries
+  // what the tile will, and variable references can be validated.
+  const previewConfig = useMemo(() => {
+    if (queriedConfig == null) {
+      return queriedConfig;
+    }
+    return {
+      ...queriedConfig,
+      filters: previewDashboardFilters?.filters,
+      variables: previewDashboardFilters?.variables,
+    };
+  }, [queriedConfig, previewDashboardFilters]);
+
+  const dbTimeChartConfig = useMemo(
+    () => computeDbTimeChartConfig(previewConfig, alert),
+    [previewConfig, alert],
+  );
+
+  // Casting because `useWatch` returns a deep partial type, but we know that the
+  // form state is complete due to default values set above.
+  const watchedForm = useWatch({ control }) as ChartEditorFormState;
+  const [debouncedForm] = useDebouncedValue(watchedForm, 300);
+  const additionalAlertWarnings = useMemo(() => {
+    if (alert == null) return [];
+    const config = convertFormStateToSavedChartConfig(
+      debouncedForm,
+      tableSource,
+    );
+    const variableWarning = config
+      ? getAlertVariableWarning(config, variables)
+      : undefined;
+    return variableWarning ? [variableWarning] : [];
+  }, [alert, debouncedForm, tableSource, variables]);
 
   const [saveToDashboardModalOpen, setSaveToDashboardModalOpen] =
     useState(false);
 
   const validateAndNormalize = useCallback(
     (form: ChartEditorFormState) => {
-      const errors = validateChartForm(form, tableSource, setError);
+      const errors = validateChartForm(form, tableSource, setError, {
+        // An inline alert has no tile to inherit a name from.
+        requireAlertDisplayName: alertsEnabled && dashboardId == null,
+      });
       if (errors.length > 0) return { errors, config: null };
 
       const savedConfig = convertFormStateToSavedChartConfig(form, tableSource);
@@ -371,6 +537,8 @@ export default function EditTimeChartForm({
     [
       tableSource,
       setError,
+      alertsEnabled,
+      dashboardId,
       chartConfigAlert,
       dirtyFields.alert?.scheduleOffsetMinutes,
       dirtyFields.alert?.scheduleStartAt,
@@ -426,10 +594,10 @@ export default function EditTimeChartForm({
     }
   }, [onSubmit, submitRef]);
 
-  const autoRunFired = useRef(false);
+  const autoRunFiredRef = useRef(false);
   useEffect(() => {
-    if (autoRun && !autoRunFired.current && tableSource) {
-      autoRunFired.current = true;
+    if (autoRun && !autoRunFiredRef.current && tableSource) {
+      autoRunFiredRef.current = true;
       onSubmit(true);
     }
   }, [autoRun, tableSource, onSubmit]);
@@ -454,6 +622,39 @@ export default function EditTimeChartForm({
     [validateAndNormalize, onSave],
   );
 
+  // Same validation path as a tile save, but hands the config to the
+  // inline-alert saver. The alert must survive the round trip: the display
+  // type could have been switched to one that drops it since it was added.
+  const handleSaveAlert = useCallback(
+    (form: ChartEditorFormState) => {
+      const { errors, config } = validateAndNormalize(form);
+      if (errors.length > 0) {
+        notifications.show({
+          id: 'chart-error',
+          title: 'Invalid Chart',
+          message: <ErrorNotificationMessage errors={errors} />,
+          color: 'red',
+        });
+        return;
+      }
+
+      if (config == null) return;
+
+      if (config.alert == null) {
+        notifications.show({
+          id: 'chart-error',
+          color: 'red',
+          title: 'Invalid alert',
+          message: 'This chart has no alert to save.',
+        });
+        return;
+      }
+
+      onSaveAlert?.(config);
+    },
+    [validateAndNormalize, onSaveAlert],
+  );
+
   // Track previous values for detecting changes
   const prevGranularityRef = useRef(granularity);
   const prevDisplayTypeRef = useRef(displayType);
@@ -476,7 +677,10 @@ export default function EditTimeChartForm({
       prevDisplayTypeRef.current = displayType;
       prevConfigTypeRef.current = configType;
 
-      if (displayType === DisplayType.Search && typeof select !== 'string') {
+      if (
+        isStringSelectDisplayType(displayType) &&
+        typeof select !== 'string'
+      ) {
         setValue('select', '');
         setValue('series', []);
       } else if (displayType === DisplayType.Heatmap) {
@@ -551,7 +755,7 @@ export default function EditTimeChartForm({
   const chartConfigForExplanations = useMemo(
     () =>
       buildChartConfigForExplanations({
-        queriedConfig,
+        queriedConfig: previewConfig,
         queriedSourceId: queriedSource?.id,
         tableSource,
         chartConfig,
@@ -560,7 +764,7 @@ export default function EditTimeChartForm({
         dbTimeChartConfig,
       }),
     [
-      queriedConfig,
+      previewConfig,
       queriedSource?.id,
       tableSource,
       chartConfig,
@@ -576,32 +780,55 @@ export default function EditTimeChartForm({
   const [parentRef, setParentRef] = useState<HTMLElement | null>(null);
 
   const handleUpdateDisplaySettings = useCallback(
-    ({
-      numberFormat,
-      alignDateRangeToGranularity,
-      fillNulls,
-      compareToPreviousPeriod,
-      fitYAxisToData,
-      groupByColumnsOnLeft,
-      seriesLimit,
-      color,
-      colorRules,
-    }: ChartConfigDisplaySettings) => {
-      setValue('numberFormat', numberFormat);
+    (
+      {
+        numberFormat,
+        alignDateRangeToGranularity,
+        fillNulls,
+        compareToPreviousPeriod,
+        fitYAxisToData,
+        groupByColumnsOnLeft,
+        alternateRowBackground,
+        seriesLimit,
+        color,
+        colorRules,
+        backgroundChart,
+        legendTemplate,
+      }: ChartConfigDisplaySettings,
+      isDirty: boolean,
+    ) => {
+      // Only persist an explicit numberFormat. When the drawer emits undefined
+      // (the user never chose a format), leave it unset so render-time
+      // auto-detection keeps driving the format from the datasource.
+      if (numberFormat !== undefined) {
+        setValue('numberFormat', numberFormat);
+      }
       setValue('alignDateRangeToGranularity', alignDateRangeToGranularity);
       setValue('fillNulls', fillNulls);
       setValue('compareToPreviousPeriod', compareToPreviousPeriod);
       setValue('fitYAxisToData', fitYAxisToData);
       setValue('groupByColumnsOnLeft', groupByColumnsOnLeft);
+      setValue('alternateRowBackground', alternateRowBackground);
       // Persist `null` (not undefined) when cleared so the disabled state
-      // survives JSON round-tripping through the URL query state — otherwise
+      // survives JSON round-tripping through the URL query state; otherwise
       // the dropped key lets RHF's `values` sync restore the stale value.
       setValue('seriesLimit', seriesLimit ?? null);
       setValue('color', color);
       setValue('colorRules', colorRules);
+      setValue('backgroundChart', backgroundChart);
+      // Empty string (not undefined) so the cleared state survives the URL round-trip.
+      if (configType === 'promql') {
+        setValue('legendTemplate', legendTemplate ?? '');
+      }
+      // Display settings live in a separate drawer form, so RHF can't track
+      // them. Latch dirty state only when the drawer reports actual changes.
+      if (isDirty) {
+        subFormDirtyRef.current = true;
+        onDirtyChange?.(true);
+      }
       onSubmit();
     },
-    [setValue, onSubmit],
+    [setValue, onDirtyChange, onSubmit, configType],
   );
 
   const handleUpdateHeatmapSettings = useCallback(
@@ -609,10 +836,13 @@ export default function EditTimeChartForm({
       setValue('series.0.valueExpression', data.value);
       setValue('series.0.countExpression', data.count || 'count()');
       setValue('series.0.heatmapScaleType', data.scaleType);
+      // Heatmap settings are applied outside RHF's change tracking.
+      subFormDirtyRef.current = true;
+      onDirtyChange?.(true);
       onSubmit();
       closeHeatmapSettings();
     },
-    [setValue, onSubmit, closeHeatmapSettings],
+    [setValue, onDirtyChange, onSubmit, closeHeatmapSettings],
   );
 
   const heatmapValueExpression = useWatch({
@@ -662,7 +892,7 @@ export default function EditTimeChartForm({
                   value={DisplayType.Line}
                   leftSection={<IconChartLine size={16} />}
                 >
-                  Line/Bar
+                  Time Series
                 </Tabs.Tab>
                 <Tabs.Tab
                   value={DisplayType.Table}
@@ -675,6 +905,12 @@ export default function EditTimeChartForm({
                   leftSection={<IconNumbers size={16} />}
                 >
                   Number
+                </Tabs.Tab>
+                <Tabs.Tab
+                  value={DisplayType.Bar}
+                  leftSection={<IconChartBar size={16} />}
+                >
+                  Bar
                 </Tabs.Tab>
                 <Tabs.Tab
                   value={DisplayType.Pie}
@@ -693,6 +929,12 @@ export default function EditTimeChartForm({
                   leftSection={<IconGrid3x3 size={16} />}
                 >
                   Heatmap
+                </Tabs.Tab>
+                <Tabs.Tab
+                  value={DisplayType.EventPatterns}
+                  leftSection={<IconBracketsContain size={16} />}
+                >
+                  Patterns
                 </Tabs.Tab>
                 <Tabs.Tab
                   value={DisplayType.Markdown}
@@ -772,7 +1014,11 @@ export default function EditTimeChartForm({
             onSubmit={onSubmit}
             isDashboardForm={isDashboardForm}
             alert={alert}
+            additionalWarnings={additionalAlertWarnings}
+            alertsEnabled={alertsEnabled}
+            isAlertRequired={isAlertRequired}
             dashboardId={dashboardId}
+            variables={variables}
           />
         ) : (
           <ChartEditorControls
@@ -794,7 +1040,11 @@ export default function EditTimeChartForm({
             displayType={displayType}
             activeTab={activeTab}
             seriesReturnType={seriesReturnType}
+            ratioMode={ratioMode}
             alert={alert}
+            additionalWarnings={additionalAlertWarnings}
+            alertsEnabled={alertsEnabled}
+            isAlertRequired={isAlertRequired}
             isRawSqlInput={isRawSqlInput}
             dashboardId={dashboardId}
             parentRef={parentRef}
@@ -818,14 +1068,21 @@ export default function EditTimeChartForm({
           onSave={onSave}
           onClose={onClose}
           isSaving={isSaving}
+          hasAlert={alert != null}
+          handleSaveAlert={handleSaveAlert}
+          onSaveAlert={onSaveAlert}
+          saveAlertLabel={saveAlertLabel}
+          isSavingAlert={isSavingAlert}
+          showSaveToDashboard={showSaveToDashboard}
           displayedTimeInputValue={displayedTimeInputValue}
           setDisplayedTimeInputValue={setDisplayedTimeInputValue}
           onTimeRangeSearch={onTimeRangeSearch}
+          filtersToggle={dashboardFiltersToggleProps}
           setSaveToDashboardModalOpen={setSaveToDashboardModalOpen}
         />
       </ErrorBoundary>
       <ChartPreviewPanel
-        queriedConfig={queriedConfig}
+        queriedConfig={previewConfig}
         tableSource={tableSource}
         dateRange={dateRange}
         activeTab={activeTab}
@@ -835,7 +1092,11 @@ export default function EditTimeChartForm({
         chartConfigForExplanations={chartConfigForExplanations}
         showGeneratedSql={showGeneratedSql}
         showSampleEvents={showSampleEvents}
+        showGeneratedPromql={isPromqlInput}
         dbTimeChartConfig={dbTimeChartConfig}
+        missingRequiredFilterNames={
+          previewDashboardFilters?.missingRequiredFilterNames
+        }
         setValue={(name, value) => setValue(name, value)}
         onSubmit={onSubmit}
       />

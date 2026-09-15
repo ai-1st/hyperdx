@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo } from 'react';
 import Link from 'next/link';
 import Router, { useRouter } from 'next/router';
+import Script from 'next/script';
 import cx from 'classnames';
 import HyperDX from '@hyperdx/browser';
 import { SavedSearchListApiResponse } from '@hyperdx/common-utils/dist/types';
@@ -29,9 +30,10 @@ import {
 
 import api from '@/api';
 import { AlertStatusIcon } from '@/components/AlertStatusIcon';
-import { IS_LOCAL_MODE } from '@/config';
+import { APP_VERSION, IS_LOCAL_MODE } from '@/config';
 import { Dashboard, useDashboards } from '@/dashboard';
 import { useFavorites } from '@/favorites';
+import { setHdxIdentity } from '@/hdxDebug';
 import InstallInstructionModal from '@/InstallInstructionsModal';
 import OnboardingChecklist from '@/OnboardingChecklist';
 import { useSavedSearches } from '@/savedSearch';
@@ -39,8 +41,6 @@ import { useLogomark, useWordmark } from '@/theme/ThemeProvider';
 import { UserPreferencesModal } from '@/UserPreferencesModal';
 import { useUserPreferences } from '@/useUserPreferences';
 import { useWindowSize } from '@/utils';
-
-import packageJson from '../../../package.json';
 
 import {
   AppNavCloudBanner,
@@ -53,9 +53,20 @@ import { AppNavFeedback } from './AppNavFeedback';
 
 import styles from './AppNav.module.scss';
 
-// Expose the same value Next injected at build time; fall back to package.json for dev tooling
-const APP_VERSION =
-  process.env.NEXT_PUBLIC_APP_VERSION ?? packageJson.version ?? 'dev';
+// Newest release version in the notes, inlined by next.config.mjs. Separate from
+// APP_VERSION on purpose: this one answers "what is the latest release?", which
+// is what the Help sparkle is for, while APP_VERSION answers "what build is
+// this?" and carries a build id that moves on every deploy.
+const WHATS_NEW_VERSION = process.env.NEXT_PUBLIC_WHATS_NEW_VERSION;
+
+// Reo.dev client ID for our usage tracking. USAGE_STATS_ENABLED is the opt-out.
+const REO_CLIENT_ID = '38b2e79cdb32fa7';
+
+declare global {
+  interface Window {
+    Reo?: { init: (options: { clientID: string; source?: string }) => void };
+  }
+}
 
 // Navigation link configuration
 type NavLinkConfig = {
@@ -200,6 +211,15 @@ export default function AppNav({ fixed = false }: { fixed?: boolean }) {
         userName: meData.name,
         teamName: meData.team.name,
       });
+      // Fold user/team ids + per-user toggles into window.hdx for debug reports.
+      setHdxIdentity({
+        userId: meData.id,
+        teamId: meData.team.id,
+        features: {
+          usageStats: meData.usageStatsEnabled,
+          aiAssistant: meData.aiAssistantEnabled,
+        },
+      });
     }
   }, [meData]);
 
@@ -290,7 +310,8 @@ export default function AppNav({ fixed = false }: { fixed?: boolean }) {
       pathname?.startsWith('/dashboards/') ||
       pathname === '/services' ||
       pathname === '/clickhouse' ||
-      pathname === '/kubernetes';
+      pathname === '/kubernetes' ||
+      pathname === '/llm';
 
     if (!isDashboardsPathname) return false;
 
@@ -310,7 +331,7 @@ export default function AppNav({ fixed = false }: { fixed?: boolean }) {
   ]);
 
   return (
-    <AppNavContext.Provider value={{ isCollapsed, pathname }}>
+    <AppNavContext value={{ isCollapsed, pathname }}>
       {fixed && (
         <div
           className={styles.navGhost}
@@ -461,7 +482,10 @@ export default function AppNav({ fixed = false }: { fixed?: boolean }) {
             )}
 
             {/* Help */}
-            <AppNavHelpMenu version={APP_VERSION} />
+            <AppNavHelpMenu
+              version={APP_VERSION}
+              whatsNewVersion={WHATS_NEW_VERSION}
+            />
 
             {/* Feedback */}
             <AppNavFeedback />
@@ -509,10 +533,17 @@ export default function AppNav({ fixed = false }: { fixed?: boolean }) {
             onClickUserPreferences={openUserPreferences}
             logoutUrl={IS_LOCAL_MODE ? null : `/api/logout`}
           />
-          {meData && meData.usageStatsEnabled && (
-            <img
-              referrerPolicy="no-referrer-when-downgrade"
-              src="https://static.scarf.sh/a.png?x-pxid=bbc99c42-7a75-4eee-9fb9-2b161fc4acd6"
+          {meData?.usageStatsEnabled && (
+            <Script
+              id="reo-beacon"
+              strategy="afterInteractive"
+              src={`https://static.reo.dev/${REO_CLIENT_ID}/reo.js`}
+              onLoad={() => {
+                window.Reo?.init({
+                  clientID: REO_CLIENT_ID,
+                  source: 'internal',
+                });
+              }}
             />
           )}
         </div>
@@ -521,6 +552,6 @@ export default function AppNav({ fixed = false }: { fixed?: boolean }) {
         opened={UserPreferencesOpen}
         onClose={closeUserPreferences}
       />
-    </AppNavContext.Provider>
+    </AppNavContext>
   );
 }

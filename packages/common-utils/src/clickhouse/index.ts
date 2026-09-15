@@ -3,24 +3,30 @@ import type {
   BaseResultSet,
   ClickHouseSettings,
   DataFormat,
+  Logger,
   ResponseHeaders,
   ResponseJSON,
   Row,
 } from '@clickhouse/client-common';
 import type { ClickHouseClient as WebClickHouseClient } from '@clickhouse/client-web';
 import * as SQLParser from 'node-sql-parser';
-import objectHash from 'object-hash';
 
-import { getMetadata, Metadata } from '@/core/metadata';
+import {
+  getMetadata,
+  Metadata,
+  quoteIdentifierIfNeeded,
+} from '@/core/metadata';
 import {
   renderChartConfig,
   setChartSelectsAlias,
-  splitChartConfigs,
 } from '@/core/renderChartConfig';
 import {
   extractSettingsClauseFromEnd,
   hashCode,
+  type QuotedIdentifierReplacements,
+  replaceBacktickedIdentifiers,
   replaceJsonExpressions,
+  restoreReplacements,
   splitAndTrimWithBracket,
 } from '@/core/utils';
 import { isBuilderChartConfig } from '@/guards';
@@ -31,6 +37,7 @@ export type {
   BaseResultSet,
   ClickHouseSettings,
   DataFormat,
+  Logger,
   ResponseJSON,
   Row,
 };
@@ -96,6 +103,22 @@ export const convertCHDataTypeToJSType = (
     return convertCHDataTypeToJSType(dataType.slice(15, -1));
   } else if (dataType.startsWith('Nullable(')) {
     return convertCHDataTypeToJSType(dataType.slice(9, -1));
+  } else if (dataType.startsWith('Variant(') && dataType.endsWith(')')) {
+    // A UNION ALL over branches whose column types have no least supertype
+    // (e.g. Float64 and Int64) unifies as Variant(...) when the server runs
+    // with use_variant_as_common_type = 1 (the modern default). Treat an
+    // all-numeric Variant as numeric so such columns still chart; mixed
+    // variants stay unclassified.
+    const memberTypes = splitAndTrimWithBracket(dataType.slice(8, -1));
+    if (
+      memberTypes.length > 0 &&
+      memberTypes.every(
+        memberType =>
+          convertCHDataTypeToJSType(memberType) === JSDataType.Number,
+      )
+    ) {
+      return JSDataType.Number;
+    }
   }
 
   return null;
@@ -300,6 +323,19 @@ export class ClickHouseQueryError extends Error {
 }
 
 /**
+ * Heuristically detects whether a query error is a ClickHouse "missing/unknown
+ * column" error. Useful for surfacing actionable hints (e.g. when a `SELECT *`
+ * against a Distributed/Merge table references a column absent from some target
+ * tables).
+ */
+export function isMissingColumnError(error: unknown): boolean {
+  const msg = error instanceof Error ? error.message : String(error ?? '');
+  return /Unknown (expression|identifier)|UNKNOWN_IDENTIFIER|Missing columns|NO_SUCH_COLUMN_IN_TABLE|There is no column|cannot be resolved/i.test(
+    msg,
+  );
+}
+
+/**
  * Returns columns referenced in given expression, where the expression is a comma-separated list of SQL expressions
  * E.g. "id, toStartOfInterval(timestamp, toIntervalDay(3)), user_id, json.a.b".
  */
@@ -349,73 +385,35 @@ export const extractColumnReferencesFromKey = (expr: string): string[] => {
   });
 };
 
-const castToNumber = (value: string | number) => {
-  if (typeof value === 'string') {
-    if (value.trim() === '') {
-      return NaN;
+/**
+ * Adapts a `ReadableStream` (what `BaseResultSet.stream()` returns) into an
+ * async iterable. Needed because native async iteration over `ReadableStream`
+ * is missing in some browsers we support.
+ *
+ * Each yielded value is a **chunk** — for the ClickHouse client, an array of
+ * `Row` rather than a single row.
+ */
+export async function* streamToAsyncIterator<T>(
+  stream: ReadableStream<T> | AsyncIterable<T>,
+): AsyncIterableIterator<T> {
+  // The node client's `stream()` hands back a Node `Readable`, which is already
+  // async-iterable; only the web client returns a WHATWG `ReadableStream`.
+  if (!('getReader' in stream)) {
+    yield* stream;
+    return;
+  }
+
+  const reader = stream.getReader();
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) return;
+      yield value;
     }
-    return Number(value);
+  } finally {
+    reader.releaseLock();
   }
-  return value;
-};
-
-export const computeRatio = (
-  numeratorInput: string | number,
-  denominatorInput: string | number,
-) => {
-  const numerator = castToNumber(numeratorInput);
-  const denominator = castToNumber(denominatorInput);
-
-  if (isNaN(numerator) || isNaN(denominator) || denominator === 0) {
-    return NaN;
-  }
-
-  return numerator / denominator;
-};
-
-export const computeResultSetRatio = (resultSet: ResponseJSON<any>) => {
-  const _meta = resultSet.meta;
-  const _data = resultSet.data;
-  const timestampColumn = inferTimestampColumn(_meta ?? []);
-  const _restColumns = _meta?.filter(m => m.name !== timestampColumn?.name);
-  const firstColumn = _restColumns?.[0];
-  const secondColumn = _restColumns?.[1];
-  if (!firstColumn || !secondColumn) {
-    throw new Error(
-      `Unable to compute ratio - meta information: ${JSON.stringify(_meta)}.`,
-    );
-  }
-  const ratioColumnName = `${firstColumn.name}/${secondColumn.name}`;
-  const result = {
-    ...resultSet,
-    data: _data.map(row => ({
-      [ratioColumnName]: computeRatio(
-        row[firstColumn.name],
-        row[secondColumn.name],
-      ),
-      ...(timestampColumn
-        ? {
-            [timestampColumn.name]: row[timestampColumn.name],
-          }
-        : {}),
-    })),
-    meta: [
-      {
-        name: ratioColumnName,
-        type: 'Float64',
-      },
-      ...(timestampColumn
-        ? [
-            {
-              name: timestampColumn.name,
-              type: timestampColumn.type,
-            },
-          ]
-        : []),
-    ],
-  };
-  return result;
-};
+}
 
 export interface QueryInputs<Format extends DataFormat> {
   query: string;
@@ -437,6 +435,8 @@ export type ClickhouseClientOptions = {
   application?: string;
   /** Defines how long the client will wait for a response from the ClickHouse server before aborting the request, in milliseconds */
   requestTimeout?: number;
+  /** Logger for per-query SQL debug output. When omitted, query logging is silent. */
+  customLogger?: Logger;
 };
 
 export abstract class BaseClickhouseClient {
@@ -453,6 +453,7 @@ export abstract class BaseClickhouseClient {
    */
   protected maxRowReadOnly: boolean;
   protected requestTimeout: number = 3600000;
+  protected readonly customLogger?: Logger;
 
   constructor({
     host,
@@ -461,6 +462,7 @@ export abstract class BaseClickhouseClient {
     queryTimeout,
     application,
     requestTimeout,
+    customLogger,
   }: ClickhouseClientOptions) {
     this.host = host!;
     this.username = username;
@@ -468,9 +470,19 @@ export abstract class BaseClickhouseClient {
     this.queryTimeout = queryTimeout;
     this.maxRowReadOnly = false;
     this.application = application;
+    this.customLogger = customLogger;
     if (requestTimeout != null && requestTimeout >= 0) {
       this.requestTimeout = requestTimeout;
     }
+  }
+
+  /**
+   * The configured request timeout in milliseconds. Exposed so callers (e.g.
+   * the alert task) can produce actionable error messages when a query is
+   * aborted by this timeout.
+   */
+  get requestTimeoutMs(): number {
+    return this.requestTimeout;
   }
 
   protected getClient(): WebClickHouseClient | NodeClickHouseClient {
@@ -486,22 +498,24 @@ export abstract class BaseClickhouseClient {
     await this.client?.close();
   }
 
-  protected logDebugQuery(
+  protected logQuery(
     query: string,
     query_params: Record<string, any> = {},
   ): void {
+    if (!this.customLogger) return;
+
     let debugSql = '';
     try {
       debugSql = parameterizedQueryToSql({ sql: query, params: query_params });
-    } catch (e) {
+    } catch {
       debugSql = query;
     }
 
-    console.debug('--------------------------------------------------------');
-
-    console.debug('Sending Query:', debugSql);
-
-    console.debug('--------------------------------------------------------');
+    this.customLogger.debug({
+      module: 'clickhouse',
+      message: 'Sending query',
+      args: { sql: debugSql },
+    });
   }
 
   protected async processClickhouseSettings({
@@ -569,6 +583,15 @@ export abstract class BaseClickhouseClient {
     // Enables full-text (inverted index) search.
     applySettingIfAvailable('enable_full_text_index', '1');
 
+    // 26.3 turned this on by default. On SharedMergeTree it makes PREWHERE
+    // planning fetch per-part sizes for every map key referenced — one S3 GET
+    // each, not interruptible by max_execution_time. The sizes only reorder
+    // PREWHERE conditions, so the pre-26.3 approximation is fine.
+    applySettingIfAvailable(
+      'allow_calculating_subcolumns_sizes_for_merge_tree_reading',
+      '0',
+    );
+
     return {
       ...defaultSettings,
       ...clickhouse_settings,
@@ -602,12 +625,12 @@ export abstract class BaseClickhouseClient {
                 sql: props.query,
                 params: props.query_params ?? {},
               });
-            } catch (e) {
+            } catch {
               debugSql = props.query;
             }
             err = new ClickHouseQueryError(error.message, debugSql);
             err.cause = error;
-          } catch (_) {
+          } catch {
             // ignore
           }
 
@@ -624,8 +647,13 @@ export abstract class BaseClickhouseClient {
     inputs: QueryInputs<Format>,
   ): Promise<BaseResultSet<ReadableStream, Format>>;
 
-  // TODO: only used when multi-series 'metrics' is selected (no effects on the events chart)
-  // eventually we want to generate union CTEs on the db side instead of computing it on the client side
+  /**
+   * Render the chart config into a single ClickHouse query and return the
+   * JSON result set. Multi-series metric charts (which used to fan out into
+   * one query per series merged client-side) are composed into one UNION ALL
+   * + pivot statement by renderChartConfig, so every config is exactly one
+   * query round trip.
+   */
   async queryChartConfig({
     config,
     metadata,
@@ -643,95 +671,17 @@ export abstract class BaseClickhouseClient {
     config = isBuilderChartConfig(config)
       ? setChartSelectsAlias(config)
       : config;
-    const queries: ChSql[] = await Promise.all(
-      splitChartConfigs(config).map(c =>
-        renderChartConfig(c, metadata, querySettings),
-      ),
-    );
+    const query = await renderChartConfig(config, metadata, querySettings);
 
-    const isTimeSeries = config.displayType === 'line';
-
-    const resultSets = await Promise.all(
-      queries.map(async query => {
-        const resp = await this.query<'JSON'>({
-          query: query.sql,
-          query_params: query.params,
-          format: 'JSON',
-          abort_signal: opts?.abort_signal,
-          connectionId: config.connection,
-          clickhouse_settings: opts?.clickhouse_settings,
-        });
-        return resp.json<any>();
-      }),
-    );
-
-    if (resultSets.length === 1) {
-      return resultSets[0];
-    }
-    // metrics -> join resultSets
-    else if (isBuilderChartConfig(config) && resultSets.length > 1) {
-      const metaSet = new Map<string, { name: string; type: string }>();
-      const tsBucketMap = new Map<string, Record<string, string | number>>();
-      // Seed metaSet with each split's value column in resultSet order, so the
-      // joined meta is [value0, value1, ..., non-value columns]. This matches the
-      // order of config.select that useChartNumberFormats indexes into.
-      for (const resultSet of resultSets) {
-        const valueColumn = inferNumericColumn(resultSet.meta ?? [])?.[0];
-        if (valueColumn && !metaSet.has(valueColumn.name)) {
-          metaSet.set(valueColumn.name, valueColumn);
-        }
-      }
-      // Add other (non-value) columns to metaSet
-      for (const resultSet of resultSets) {
-        if (Array.isArray(resultSet.meta)) {
-          for (const meta of resultSet.meta) {
-            const key = meta.name;
-            if (!metaSet.has(key)) {
-              metaSet.set(key, meta);
-            }
-          }
-        }
-
-        const timestampColumn = inferTimestampColumn(resultSet.meta ?? []);
-        const numericColumn = inferNumericColumn(resultSet.meta ?? []);
-        const numericColumnName = numericColumn?.[0]?.name;
-        for (const row of resultSet.data) {
-          const _rowWithoutValue = numericColumnName
-            ? Object.fromEntries(
-                Object.entries(row).filter(
-                  ([key]) => key !== numericColumnName,
-                ),
-              )
-            : { ...row };
-          const ts =
-            timestampColumn != null
-              ? row[timestampColumn.name]
-              : isTimeSeries
-                ? objectHash(_rowWithoutValue)
-                : '__FIXED_TIMESTAMP__';
-          if (tsBucketMap.has(ts)) {
-            const existingRow = tsBucketMap.get(ts);
-            tsBucketMap.set(ts, {
-              ...existingRow,
-              ...row,
-            });
-          } else {
-            tsBucketMap.set(ts, row);
-          }
-        }
-      }
-
-      const isRatio =
-        config.seriesReturnType === 'ratio' && resultSets.length === 2;
-
-      const _resultSet: ResponseJSON<any> = {
-        meta: Array.from(metaSet.values()),
-        data: Array.from(tsBucketMap.values()),
-      };
-      // TODO: we should compute the ratio on the db side
-      return isRatio ? computeResultSetRatio(_resultSet) : _resultSet;
-    }
-    throw new Error('No result sets');
+    const resp = await this.query<'JSON'>({
+      query: query.sql,
+      query_params: query.params,
+      format: 'JSON',
+      abort_signal: opts?.abort_signal,
+      connectionId: config.connection,
+      clickhouse_settings: opts?.clickhouse_settings,
+    });
+    return resp.json<any>();
   }
 
   /**
@@ -815,16 +765,182 @@ export function parameterizedQueryToSql({
   params: Record<string, any>;
 }) {
   return Object.entries(params).reduce((acc, [key, value]) => {
-    return acc.replace(new RegExp(`{${key}:\\w+}`, 'g'), value);
+    return acc.replace(new RegExp(`{${key}:(\\w+)}`, 'g'), (_, type) => {
+      return type === 'String' ? `'${value}'` : String(value);
+    });
   }, sql);
+}
+
+// Table name used when re-parsing only the outer projection (see
+// extractOuterSelectProjection). It is never executed, only fed to the parser.
+const ALIAS_FALLBACK_TABLE = '__hdx_alias_src';
+
+/**
+ * Builds an alias map from a SELECT statement that node-sql-parser can parse.
+ * Alias expressions are sliced out of `parsedSql` using the AST node
+ * locations, so callers must pass the exact string that was parsed. Throws if
+ * the SQL does not parse.
+ */
+function selectColumnsToAliasMap(
+  parsedSql: string,
+  jsonReplacements: Map<string, string>,
+  identifierReplacements: QuotedIdentifierReplacements,
+): Record<string, string> {
+  const aliasMap: Record<string, string> = {};
+  const parser = new SQLParser.Parser();
+
+  // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion -- astify returns union type
+  const ast = parser.astify(parsedSql, {
+    database: 'Postgresql',
+    parseOptions: { includeLocations: true },
+  }) as SQLParser.Select;
+
+  if (ast.columns != null) {
+    ast.columns.forEach(column => {
+      if (column.as != null) {
+        if (column.type === 'expr' && column.expr.type === 'column_ref') {
+          const escapedColumnName = quoteIdentifierIfNeeded(
+            column.expr.column.expr.value,
+          );
+          aliasMap[column.as] =
+            column.expr.array_index && column.expr.array_index[0]?.brackets
+              ? // alias with brackets, ex: ResourceAttributes['service.name'] as service_name
+                `${escapedColumnName}['${column.expr.array_index[0].index.value}']`
+              : // normal alias
+                escapedColumnName;
+        } else if (column.expr.loc != null) {
+          aliasMap[column.as] = parsedSql.slice(
+            column.expr.loc.start.offset,
+            column.expr.loc.end.offset,
+          );
+        } else {
+          console.error('Unknown alias column type', column);
+        }
+      }
+    });
+  }
+
+  // Replace the JSON replacement tokens with the original JSON expressions
+  for (const [alias, aliasExpression] of Object.entries(aliasMap)) {
+    for (const [replacement, original] of jsonReplacements) {
+      if (aliasExpression.includes(replacement)) {
+        aliasMap[alias] = aliasExpression.replaceAll(replacement, original);
+      }
+    }
+  }
+
+  // Replace the backticked identifier replacements with the original quoted identifiers
+  const { quotedText, names } = identifierReplacements;
+  return Object.fromEntries(
+    Object.entries(aliasMap).map(([alias, aliasExpression]) => [
+      names.get(alias) ?? alias,
+      restoreReplacements(aliasExpression, quotedText),
+    ]),
+  );
+}
+
+/**
+ * Returns the text of the outer SELECT projection (everything between the
+ * top-level SELECT and its FROM). Leading WITH/CTE clauses, the WHERE clause,
+ * and nested subqueries are skipped because their SELECT/FROM keywords sit
+ * inside parentheses. Returns null when no top-level SELECT...FROM is found.
+ *
+ * Used as a fallback by chSqlToAliasMap: the alias map only needs the outer
+ * projection's `expr AS alias` pairs, so when the full statement is
+ * unparseable by node-sql-parser (e.g. a sampling CTE containing
+ * `CAST(x AS UInt32)`), re-parsing just the projection still recovers them.
+ */
+function extractOuterSelectProjection(sql: string): string | null {
+  let parenDepth = 0;
+  let inSingleQuote = false;
+  let inDoubleQuote = false;
+  let inBacktick = false;
+  let projectionStart = -1;
+
+  const isWordChar = (c: string | undefined) =>
+    c != null && /[A-Za-z0-9_]/.test(c);
+  const matchesKeywordAt = (index: number, keyword: string): boolean => {
+    if (sql.slice(index, index + keyword.length).toUpperCase() !== keyword) {
+      return false;
+    }
+    // Require word boundaries so we don't match inside a longer identifier.
+    return (
+      !isWordChar(sql[index - 1]) && !isWordChar(sql[index + keyword.length])
+    );
+  };
+
+  for (let i = 0; i < sql.length; i++) {
+    const c = sql[i];
+
+    // Skip over string / quoted-identifier contents so keywords and brackets
+    // inside them are ignored.
+    if (inSingleQuote) {
+      if (c === "'") inSingleQuote = false;
+      continue;
+    }
+    if (inDoubleQuote) {
+      if (c === '"') inDoubleQuote = false;
+      continue;
+    }
+    if (inBacktick) {
+      if (c === '`') inBacktick = false;
+      continue;
+    }
+    // Skip SQL comments so keywords / brackets inside them are ignored.
+    if (c === '-' && sql[i + 1] === '-') {
+      const lineEnd = sql.indexOf('\n', i + 2);
+      if (lineEnd === -1) break;
+      i = lineEnd;
+      continue;
+    }
+    if (c === '/' && sql[i + 1] === '*') {
+      const blockEnd = sql.indexOf('*/', i + 2);
+      if (blockEnd === -1) break;
+      i = blockEnd + 1;
+      continue;
+    }
+    if (c === "'") {
+      inSingleQuote = true;
+      continue;
+    }
+    if (c === '"') {
+      inDoubleQuote = true;
+      continue;
+    }
+    if (c === '`') {
+      inBacktick = true;
+      continue;
+    }
+    if (c === '(') {
+      parenDepth++;
+      continue;
+    }
+    if (c === ')') {
+      parenDepth--;
+      continue;
+    }
+    if (parenDepth !== 0) {
+      continue;
+    }
+
+    if (projectionStart === -1) {
+      if (matchesKeywordAt(i, 'SELECT')) {
+        projectionStart = i + 'SELECT'.length;
+        i = projectionStart - 1;
+      }
+    } else if (matchesKeywordAt(i, 'FROM')) {
+      return sql.slice(projectionStart, i).trim();
+    }
+  }
+
+  return null;
 }
 
 export function chSqlToAliasMap(
   chSql: ChSql | undefined,
 ): Record<string, string> {
-  const aliasMap: Record<string, string> = {};
   if (chSql == null || !chSql.sql) {
-    return aliasMap;
+    return {};
   }
 
   try {
@@ -833,48 +949,38 @@ export function chSqlToAliasMap(
     // Remove the SETTINGS clause because `SQLParser` doesn't understand it.
     const [sqlWithoutSettingsClause] = extractSettingsClauseFromEnd(sql);
 
+    // Replace backtick-quoted identifiers with placeholder tokens so that a
+    // quoted alias doesn't fail the parse
+    const {
+      sqlWithReplacements: sqlWithoutBackticks,
+      replacements: identifierReplacementsToExpressions,
+    } = replaceBacktickedIdentifiers(sqlWithoutSettingsClause);
+
     // Replace JSON expressions with replacement tokens so that node-sql-parser can parse the SQL
     const { sqlWithReplacements, replacements: jsonReplacementsToExpressions } =
-      replaceJsonExpressions(sqlWithoutSettingsClause);
-    const parser = new SQLParser.Parser();
+      replaceJsonExpressions(sqlWithoutBackticks);
 
-    // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion -- astify returns union type
-    const ast = parser.astify(sqlWithReplacements, {
-      database: 'Postgresql',
-      parseOptions: { includeLocations: true },
-    }) as SQLParser.Select;
-
-    if (ast.columns != null) {
-      ast.columns.forEach(column => {
-        if (column.as != null) {
-          if (column.type === 'expr' && column.expr.type === 'column_ref') {
-            aliasMap[column.as] =
-              column.expr.array_index && column.expr.array_index[0]?.brackets
-                ? // alias with brackets, ex: ResourceAttributes['service.name'] as service_name
-                  `${column.expr.column.expr.value}['${column.expr.array_index[0].index.value}']`
-                : // normal alias
-                  column.expr.column.expr.value;
-          } else if (column.expr.loc != null) {
-            aliasMap[column.as] = sqlWithReplacements.slice(
-              column.expr.loc.start.offset,
-              column.expr.loc.end.offset,
-            );
-          } else {
-            console.error('Unknown alias column type', column);
-          }
-        }
-      });
-    }
-
-    // Replace the JSON replacement tokens with the original JSON expressions
-    for (const [alias, aliasExpression] of Object.entries(aliasMap)) {
-      for (const [replacement, original] of jsonReplacementsToExpressions) {
-        if (aliasExpression.includes(replacement)) {
-          aliasMap[alias] = aliasExpression.replaceAll(replacement, original);
-        }
+    try {
+      return selectColumnsToAliasMap(
+        sqlWithReplacements,
+        jsonReplacementsToExpressions,
+        identifierReplacementsToExpressions,
+      );
+    } catch (fullParseError) {
+      // node-sql-parser's Postgresql dialect rejects some ClickHouse-specific
+      // SQL (e.g. `CAST(x AS UInt32)` in a sampling CTE, or parameterized
+      // identifiers). The alias map only needs the outer SELECT projection, so
+      // retry with `SELECT <projection> FROM <table>` before giving up.
+      const projection = extractOuterSelectProjection(sqlWithReplacements);
+      if (projection == null) {
+        throw fullParseError;
       }
+      return selectColumnsToAliasMap(
+        `SELECT ${projection} FROM ${ALIAS_FALLBACK_TABLE}`,
+        jsonReplacementsToExpressions,
+        identifierReplacementsToExpressions,
+      );
     }
-    return aliasMap;
   } catch (e) {
     console.error(
       'Error parsing alias map with JSON removed',
@@ -884,7 +990,7 @@ export function chSqlToAliasMap(
     );
   }
 
-  return aliasMap;
+  return {};
 }
 
 export type ColumnMetaType = { name: string; type: string };

@@ -3,9 +3,8 @@
 // the stock image behaves exactly like upstream (password-only) until the
 // OIDC_* env vars are set. Users are JIT-provisioned into the team on first login,
 // mirroring the existing invite flow (routers/api/root.ts -> /team/setup/:token).
-import * as querystring from 'querystring';
-
 import { Strategy as OpenIDConnectStrategy } from 'passport-openidconnect';
+import * as querystring from 'querystring';
 
 import * as config from '@/config';
 import { createTeam, getDefaultTeam } from '@/controllers/team';
@@ -75,9 +74,9 @@ function applyClientSecretBasic(strategy: OpenIDConnectStrategy): void {
   const oauth2 = (strategy as any)._oauth2;
   const basic =
     'Basic ' +
-    Buffer.from(`${config.OIDC_CLIENT_ID}:${config.OIDC_CLIENT_SECRET}`).toString(
-      'base64',
-    );
+    Buffer.from(
+      `${config.OIDC_CLIENT_ID}:${config.OIDC_CLIENT_SECRET}`,
+    ).toString('base64');
   oauth2.getOAuthAccessToken = function (
     code: string,
     params: Record<string, any>,
@@ -108,7 +107,7 @@ function applyClientSecretBasic(strategy: OpenIDConnectStrategy): void {
         let results: any;
         try {
           results = JSON.parse(data);
-        } catch (e) {
+        } catch {
           results = querystring.parse(data);
         }
         const accessToken = results.access_token;
@@ -152,7 +151,10 @@ export function buildOidcStrategy(): OpenIDConnectStrategy {
           return cb(null, false, { message: 'No email in SSO profile' });
         }
         if (!emailDomainAllowed(email)) {
-          logger.warn({ email }, 'SSO login rejected: email domain not allowed');
+          logger.warn(
+            { email },
+            'SSO login rejected: email domain not allowed',
+          );
           return cb(null, false, { message: 'Email domain not allowed' });
         }
 

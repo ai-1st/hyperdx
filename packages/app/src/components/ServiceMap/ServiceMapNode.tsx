@@ -1,22 +1,31 @@
+import { use } from 'react';
 import { TTraceSource } from '@hyperdx/common-utils/dist/types';
 import { Text } from '@mantine/core';
 import { Handle, Node, NodeProps, NodeToolbar, Position } from '@xyflow/react';
 
 import { ServiceAggregation } from '@/hooks/useServiceMap';
 
+import { ServiceMapMetricContext } from './ServiceMapMetricContext';
 import ServiceMapTooltip from './ServiceMapTooltip';
-import { deriveDisplayMetrics, getNodeColors, getNodeSize } from './utils';
+import {
+  deriveDisplayMetrics,
+  getNodeColors,
+  getNodeSize,
+  getServiceMetricValue,
+} from './utils';
 
 import styles from './ServiceMap.module.scss';
 
 export type ServiceMapNodeData = ServiceAggregation & {
   dateRange: [Date, Date];
   source: TTraceSource;
-  maxErrorPercentage: number;
   // Largest total throughput (incoming + outgoing) across all nodes, used to
   // scale node size.
   maxThroughput: number;
   isSingleTrace?: boolean;
+  // Name of the service the map is currently focused on (if any), so a node can
+  // tell whether it is the focused one and show the matching CTA.
+  focusedService?: string;
   // When provided, the node's tooltip offers a "Focus" action for this service.
   onFocusService?: (serviceName: string) => void;
 };
@@ -38,17 +47,22 @@ export default function ServiceMapNode(
     outgoingRequests,
     source,
     dateRange,
-    maxErrorPercentage,
     maxThroughput,
     isSingleTrace,
+    focusedService,
     onFocusService,
   } = data;
 
-  const { backgroundColor, borderColor } = getNodeColors(
-    errorPercentage,
-    maxErrorPercentage,
-    props.selected,
-  );
+  const { metric, metricMax } = use(ServiceMapMetricContext);
+
+  const { backgroundColor, borderColor, borderStyle, borderWidth } =
+    getNodeColors(
+      getServiceMetricValue(data, metric),
+      metricMax[metric],
+      props.selected,
+      metric,
+      totalIncomingRequestCount > 0,
+    );
 
   // Fallback matches the schema default (3 = ms); in practice the field is
   // always present on a parsed source.
@@ -82,6 +96,7 @@ export default function ServiceMapNode(
           dateRange={dateRange}
           serviceName={serviceName}
           isSingleTrace={isSingleTrace}
+          isFocused={focusedService === serviceName}
           onFocus={
             onFocusService && !isSingleTrace
               ? () => onFocusService(serviceName)
@@ -103,6 +118,8 @@ export default function ServiceMapNode(
             style={{
               backgroundColor,
               borderColor,
+              borderStyle,
+              borderWidth,
               width: size,
               height: size,
             }}

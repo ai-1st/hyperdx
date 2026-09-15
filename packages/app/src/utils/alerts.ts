@@ -6,16 +6,23 @@ import {
 } from 'date-fns';
 import _ from 'lodash';
 import { z } from 'zod';
+import { formatTileAlertDisplayName } from '@hyperdx/common-utils/dist/alerts';
 import { Granularity } from '@hyperdx/common-utils/dist/core/utils';
+import { isPromqlSavedChartConfig } from '@hyperdx/common-utils/dist/guards';
 import {
+  type Alert,
   ALERT_INTERVAL_TO_MINUTES,
   AlertChannelType,
+  AlertChartConfig,
   AlertInterval,
+  AlertSource,
   AlertThresholdType,
   ChartAlertBaseSchema,
+  SavedChartConfig,
 } from '@hyperdx/common-utils/dist/types';
 
 import { IS_DEV } from '@/config';
+import type { AlertsPageItem } from '@/types';
 
 export function intervalToGranularity(interval: AlertInterval) {
   if (interval === '1m') return Granularity.OneMinute;
@@ -128,16 +135,55 @@ export const ALERT_CHANNEL_OPTIONS: Record<AlertChannelType, string> = {
   webhook: 'Webhook',
 };
 
+const EMPTY_ALERT_CHANNEL = { type: 'webhook', webhookId: '' } as const;
+
+/**
+ * Form value for an alert's notification channels. Alerts saved before
+ * multi-channel support only carry the singular `channel`, and the form always
+ * needs at least one row to render.
+ *
+ * A downstream fork defines channel types this repo doesn't (e.g. email).
+ * Channels are copied through untouched rather than rebuilt field-by-field,
+ * so saving an alert here never destroys fields this repo doesn't know about.
+ */
+export function toAlertChannels<T extends { type?: string | null }>(alert?: {
+  channel?: T | null;
+  channels?: T[] | null;
+}): T[] | [typeof EMPTY_ALERT_CHANNEL] {
+  const source = alert?.channels?.length
+    ? alert.channels
+    : alert?.channel != null && alert.channel.type != null
+      ? [alert.channel]
+      : [];
+  return source.length > 0 ? source : [{ ...EMPTY_ALERT_CHANNEL }];
+}
+
+/**
+ * An alert's channels in the shape an edit form carries.
+ *
+ * `AlertsPageItem` types a channel loosely (`type?: string | null`) because it
+ * echoes whatever was persisted, including rows written before multi-channel
+ * support; the form's `Alert` shape is strict. Channels are copied through
+ * rather than rebuilt field-by-field, so a fork's extra channel fields survive
+ * an edit — only `webhookId` is coerced, because the picker needs a string.
+ */
+export function toFormAlertChannels(alert: {
+  channel?: { type?: string | null; webhookId?: string } | null;
+  channels?: { type?: string | null; webhookId?: string }[] | null;
+}): NonNullable<Alert['channels']> {
+  return toAlertChannels(alert).map(c => ({
+    ...c,
+    webhookId: c.webhookId ?? '',
+  })) as NonNullable<Alert['channels']>;
+}
+
 export const DEFAULT_TILE_ALERT: z.infer<typeof ChartAlertBaseSchema> = {
   threshold: 1,
   thresholdType: AlertThresholdType.ABOVE,
   interval: '5m',
   scheduleOffsetMinutes: 0,
   scheduleStartAt: null,
-  channel: {
-    type: 'webhook',
-    webhookId: '',
-  },
+  channels: [{ ...EMPTY_ALERT_CHANNEL }],
   note: null,
 };
 
@@ -214,4 +260,117 @@ export function normalizeNoOpAlertScheduleFields<
   }
 
   return normalizedAlert as T;
+}
+
+/**
+ * Human label for what an alert watches. Shared by the row's source icon
+ * tooltip, the alerts-page source filter, and free-text search, so all three
+ * agree on the wording a user sees and types.
+ */
+export function getAlertSourceLabel(alert: {
+  source?: AlertSource | null;
+}): string {
+  switch (alert.source) {
+    case AlertSource.TILE:
+      return 'Dashboard tile';
+    case AlertSource.SAVED_SEARCH:
+      return 'Saved search';
+    case AlertSource.INLINE:
+      return 'Chart';
+    default:
+      return 'Unknown source';
+  }
+}
+
+/**
+ * The name the server would derive if the alert had none of its own. Only for
+ * previewing (e.g. the name input's placeholder);
+ */
+export function getDerivedAlertDisplayName(
+  alert: AlertsPageItem,
+): string | undefined {
+  if (alert.source === AlertSource.TILE && alert.dashboard) {
+    const tile = alert.dashboard.tiles.find(t => t.id === alert.tileId);
+    return formatTileAlertDisplayName(alert.dashboard.name, tile?.config.name);
+  }
+  if (alert.source === AlertSource.SAVED_SEARCH && alert.savedSearch) {
+    return alert.savedSearch.name;
+  }
+  // Mirrors what the server derives for an inline alert, which has no
+  // referenced entity to inherit from — only the chart it carries.
+  if (alert.source === AlertSource.INLINE) {
+    return alert.chartConfig?.name || undefined;
+  }
+  return undefined;
+}
+
+/**
+ * URL of what the alert watches: the saved search, the dashboard tile, or —
+ * for an inline alert — the chart explorer opened on its persisted query.
+ *
+ * The inline link carries the alert's id rather than its config, because the
+ * alerts list response omits `chartConfig` and a row would otherwise have no
+ * link at all. The explorer resolves it (see `useAlertSeededChartConfig`),
+ * which also means the link opens the query as it stands now rather than a
+ * snapshot. The notification link inlines the config instead — it is built
+ * server-side, where there is no session to fetch with — but lands on the
+ * same chart.
+ */
+export function getAlertSourceUrl(alert: AlertsPageItem): string {
+  if (alert.source === AlertSource.TILE && alert.dashboard) {
+    return `/dashboards/${alert.dashboardId}?highlightedTileId=${alert.tileId}`;
+  }
+  if (alert.source === AlertSource.SAVED_SEARCH && alert.savedSearch) {
+    return `/search/${alert.savedSearchId}`;
+  }
+  if (alert.source === AlertSource.INLINE) {
+    return `/chart?alertId=${alert._id}`;
+  }
+  return '';
+}
+
+/**
+ * Payload shape for an inline alert: the alert's own fields plus the chart
+ * config it persists. Structurally the inline member of `AlertSchema`, spelled
+ * out here so the app can build one without threading the union's refinements.
+ */
+export type InlineAlert = z.infer<typeof ChartAlertBaseSchema> & {
+  source: AlertSource.INLINE;
+  chartConfig: AlertChartConfig;
+};
+
+/**
+ * Split a chart-editor config into the inline-alert API payload: the alert
+ * fields live on the alert document, and everything else is persisted as its
+ * `chartConfig`.
+ *
+ * `displayName` and `tags` pass through as the form holds them. The editor
+ * requires a name for an inline alert, since there is no tile or saved search
+ * to inherit one from; the server still derives one from the chart config for
+ * API and MCP callers that omit it.
+ *
+ * Returns undefined when the config carries no alert — the caller has nothing
+ * to save, and the chart editor lets an alert be removed before saving.
+ */
+export function buildInlineAlertPayload(
+  config: SavedChartConfig,
+): InlineAlert | undefined {
+  // PromQL configs have no inline-alert representation (the schema has no
+  // PromQL variant), and the editor never offers an alert on one.
+  if (config.alert == null || isPromqlSavedChartConfig(config)) {
+    return undefined;
+  }
+  const { alert, ...chartConfig } = config;
+  return {
+    ...alert,
+    source: AlertSource.INLINE,
+    chartConfig,
+  };
+}
+
+export function getAlertCreatorLabel(
+  alert: AlertsPageItem,
+): string | undefined {
+  if (!alert.createdBy) return undefined;
+  return alert.createdBy.name || alert.createdBy.email;
 }

@@ -60,12 +60,13 @@ Use BUILDER tiles (with sourceId) for most cases:
   number       Single KPI metric (total requests, current error rate, p99 latency).
   table        Ranked lists (top endpoints by latency, error counts by service). Tables can wire row-click navigation via config.onClick to the /search page or another dashboard. See "TABLE TILE LINKING" below.
   pie          Proportional breakdowns (traffic share by service, errors by type). Keep slice count under 8.
+  bar          Categorical comparisons (request counts by service, errors by endpoint). One bar per group value; not a time series (use stacked_bar for that).
   heatmap      Distribution of a numeric value over time (latency buckets, payload size). Trace sources only. Requires non-empty valueExpression.
   search       Browse raw log/event rows (error logs, recent traces).
-  markdown     Use sparingly. The dashboard already shows its name in the title bar at the top; do NOT add a "About this dashboard" tile that repeats it. Markdown bodies render h1/h2/h3 headings at title-bar scale, so a single \`## Service Catalog\` line eats most of the tile and pushes real KPIs below the fold. Skip markdown tiles for starter dashboards. If you must add one, use h: 1, plain prose, no \`#\`/\`##\`/\`###\` headings. Use containers/tabs for section grouping instead.
+  markdown     Use sparingly. The dashboard already shows its name in the title bar at the top; do NOT add a "About this dashboard" tile that repeats it. Markdown bodies render h1/h2/h3 headings at title-bar scale, so a single \`## Service Catalog\` line eats most of the tile and pushes real KPIs below the fold. Skip markdown tiles for starter dashboards. If you must add one, size it to fit the text (h: 2-3 for a line or two; h: 1 clips it), use plain prose, no \`#\`/\`##\`/\`###\` headings. Use containers/tabs for section grouping instead.
 
 Use RAW SQL tiles (with connectionId) only for queries the builder cannot express:
-  Requires configType: "sql" plus a displayType (line, stacked_bar, table, number, pie).
+  Requires configType: "sql" plus a displayType (line, stacked_bar, table, number, pie, bar).
   Use when you need JOINs, sub-queries, CTEs, or expressions the builder does not generate.
   ALWAYS set sourceId on a raw SQL tile (in addition to connectionId) UNLESS the query reads
   from multiple tables (e.g. JOINs across sources). sourceId enables the $__filters and 
@@ -107,6 +108,14 @@ Apply these before calling clickstack_save_dashboard. Each rule is enforced by t
 
 9. FOR FOCUSED PER-DIMENSION DASHBOARDS, DECLARE A DASHBOARD-LEVEL FILTER. Pass filters: [{ type: "QUERY_EXPRESSION", name, expression, sourceId }] at the top level. The user gets a dropdown in the dashboard header; by default every tile is re-scoped when a value is picked. On mixed-source dashboards add appliesToSourceIds: ["<id>", ...] to restrict the filter to only the tiles whose source carries that column. Omit the field to keep the broadcast-to-all-tiles default. Do NOT hardcode the dimension into each tile's where clause.
 
+9b. USE A VARIABLE FILTER ONLY WHEN BROADCAST CANNOT DO THE JOB. A filter with isVariableEnabled: true publishes its value as $variableName instead of applying it automatically, and only the tiles that reference it are affected. That is the right shape when the predicate is not a plain equality (NOT IN, LIKE, a regex, a range), when the value has to sit somewhere a WHERE condition cannot go (a CTE, a SELECT expression, a JOIN condition), or when different tiles need the same value against different columns. Set isBroadcastEnabled: false alongside it; leaving both on applies the value twice. Reference it as $__filter(<expression>, $<variableName>) rather than a bare $variableName, which renders as NULL before anything is selected. Both macros work in every SQL condition on a builder tile: a select item's where, the tile-level where on search / heatmap / event_patterns tiles, having, groupBy, and orderBy. Set whereLanguage: "sql" on the input that carries one; in a Lucene input they are matched as literal text.
+
+9c. TO CHAIN ONE DROPDOWN OFF ANOTHER, REFERENCE A VARIABLE IN THE DOWNSTREAM FILTER'S OWN where. A filter's where scopes the values ITS dropdown offers and is never applied to a tile, so a dashboard can pick a service and then offer only that service's endpoints: filters: [{ name: "Service", expression: "ServiceName", isVariableEnabled: true, variableName: "service", ... }, { name: "Endpoint", expression: "SpanName", whereLanguage: "sql", where: "$__filter(ServiceName, $service)", ... }]. Only the upstream filter needs isVariableEnabled, and it can keep broadcasting because its value is read by a dropdown rather than a tile. Use $__filter here too so the downstream dropdown lists everything until a service is picked; a bare $service leaves it empty.
+
+9d. USE A STATIC_LIST FILTER WHEN THE DROPDOWN SHOULD OFFER A FIXED HAND-AUTHORED LIST. When the values are a business list (environments, tenants, tiers) or a curated subset rather than derivable from the data, declare filters: [{ type: "STATIC_LIST", name, options: ["prod", "staging"], variableName }]. It takes no expression, sourceId, or where, and it is always variable-only (there is nothing to broadcast), so tiles must reference $variableName, typically via $__filter(<expression>, $<variableName>) with the column passed explicitly (the one-argument $__filter($var) form fails because the filter has no expression of its own).
+
+9e. MAKE A FILTER REQUIRED ONLY WHEN AN UNSCOPED VIEW IS MEANINGLESS. minSelections: 1 blocks the tiles that read the filter - the ones referencing its $variableName, and the ones its broadcast applies to - until the user picks a value. isGlobalRequirement: true widens that to every tile on the dashboard. Consider pairing either form with savedFilterValues so the dashboard opens on a sensible default rather than blocked.
+
 10. UPDATE IS REPLACE, NOT MERGE. clickstack_save_dashboard with an id overwrites tiles, containers, and filters in their entirety. Call clickstack_get_dashboard first when you only want to add or rename one entry; do not send a partial set or you will silently drop everything you omitted.
 
 11. GROUP RELATED TILES INTO CONTAINERS. REQUIRED at five or more tiles, no exceptions. An ungrouped wall of nine or ten tiles is a readability failure even when each tile is correct in isolation. Containers are the right way to introduce structure; markdown tiles for section labels are not.
@@ -124,9 +133,13 @@ Apply these before calling clickstack_save_dashboard. Each rule is enforced by t
      ]
    Use tabs when one container needs to show different views of the same data (Throughput / Latency / Errors over time, for instance); the tab bar appears when a container has two or more tabs declared.
 
-12. VALIDATE EVERY TILE AFTER SAVE. After clickstack_save_dashboard, call clickstack_query_tile on EVERY tile (not just one). Save validates input shape; it does NOT validate query semantics. Some queries pass save and fail at render time (known gaps: Lucene comparison/wildcard on map attributes, metric tiles with multiple metricTables, malformed having clauses). If query_tile returns an error, fix the tile and re-save before declaring the dashboard ready.
+12. VALIDATE EVERY TILE AFTER SAVE. After clickstack_save_dashboard, call clickstack_query_tile on EVERY tile (not just one). Save validates input shape; it does NOT validate query semantics. Some queries pass save and fail at render time (known gaps: Lucene comparison/wildcard on map attributes, malformed having clauses). If query_tile returns an error, fix the tile and re-save before declaring the dashboard ready.
 
 13. NO TITLE-RECAP MARKDOWN TILE. The dashboard's name shows in the title bar. Adding a markdown tile with the dashboard name (or a "About this dashboard" header) doubles the title and eats a row of vertical space because markdown heading styles render at title-bar scale. Skip the markdown tile entirely on starter dashboards.
+
+14. SIZE TILES TO FIT THEIR CONTENT. The layout w/h are not one-size-fits-all; a tile that is too short clips its content (a table loses rows below the fold, a number tile crops its label) and one that is too wide wastes the row. Match the size to the displayType: number tiles stay small (w 6-8, h 3-4) so three or four KPIs share a row; line / stacked_bar / pie / bar want w 8-12 and h 4-6; tables and search lists want the full row (w 24) and h 6-10 so rows are not cut off; heatmaps want w 12 and h 5-6; a markdown note wants h 2-3 (never h 1, which clips the text). The per-field w/h descriptions on the tile schema carry the same per-displayType ranges; reach for them instead of leaving every tile at the 12x4 default.
+
+15. FILTER A BUILDER TILE ON THE SELECT ITEM, NOT THE TILE. To scope a table / line / stacked_bar / number / pie / bar tile to a subset of rows (a service, an error status), put the filter on EACH select item's where: select: [{ aggFn: "count", where: "ServiceName:payment", whereLanguage: "lucene", alias: "..." }]. The chart editor renders that per-series where as the tile's visible "Where" box, so the user can see and edit it. Do NOT put a filter at the tile config's top level for these types: the editor does not show it, so it is ignored. For a whole-dashboard scope use a dashboard-level filter (gotcha 9). The only display types with a tile-level where are search, heatmap, and event_patterns, where the editor does render it.
 
 == ADAPT, DO NOT COPY ==
 
@@ -149,11 +162,23 @@ Dashboards open with a 15-minute default window. There is no dashboard-level fie
 - Skipping clickstack_list_sources + clickstack_describe_source (you need real source IDs, column names, and values).
 - Skipping clickstack_query_tile after save (tiles can silently fail on syntax or attribute mismatches).
 - Setting chart-level numberFormat on a table that mixes counts and durations (counts render as 0:00:00).
-- Multiple select items on number / pie / heatmap tiles (each takes exactly one).
+- Multiple select items on number / pie / bar / heatmap tiles (each takes exactly one).
 - Missing level on aggFn "quantile" (must specify 0.5, 0.9, 0.95, or 0.99).
 - Assuming StatusCode or SeverityText values (always inspect lowCardinalityValues from clickstack_describe_source).
 - Heatmap on a non-Trace source (heatmap is Trace-only today).
-- Hardcoding a focus dimension into every tile's where clause (use a dashboard-level filter instead).`;
+- Hardcoding a focus dimension into every tile's where clause (use a dashboard-level filter instead).
+- Putting a filter at the tile-config top level on a table / line / stacked_bar / number / pie / bar tile (ignored for these types; put the where on each select item instead, see gotcha 15).
+- Enabling both isBroadcastEnabled and isVariableEnabled on one filter (the picked value is then applied twice; set isBroadcastEnabled: false when you add a variable). The exception is rule 9c: a variable read only by another filter's where never reaches a tile, so that filter can keep broadcasting.
+- Broadcasting one filter across sources that do not share the column (it is ANDed onto every tile and fails at query time; scope it with appliesToSourceIds or make it a variable).
+- Referencing a variable as a bare $var instead of $__filter(<expression>, $<var>) or $__conditionalAll(<condition>, $<var>). A bare reference renders as NULL with nothing selected, so the tile shows zero rows on a freshly-opened dashboard.
+- Dropping the $ from the variable argument of a macro. It is $__filter(ServiceName, $service), not $__filter(ServiceName, service).
+- Wrapping a variable reference in quotes. The default SQL format (sqlstring) already quotes each value.
+- Adding a redundant format specifier such as \${var:sqlstring}, or omitting a needed one such as \${var:regex} inside match() and \${var:csv} inside a literal.
+- Using $__filter or $__conditionalAll in a Lucene where (they are matched as literal text; switch to whereLanguage: "sql", or write ServiceName:$var).
+- Chaining a filter's where off a filter that is not variable-enabled. Only isVariableEnabled: true publishes the $variableName token; without it the reference resolves to nothing and the downstream dropdown is unscoped or empty.
+- Referencing a filter's OWN variable in its where. That narrows its dropdown to the values already picked, so the rest of the options vanish from a multi-select. Reference a sibling filter's variable instead.
+- Mixing filter-type fields: expression/sourceId/where belong to QUERY_EXPRESSION filters, options to STATIC_LIST filters.
+- Expecting a STATIC_LIST filter to broadcast. It cannot; a tile must reference its $variableName (via $__filter with the column passed explicitly) or nothing changes when the user picks a value.`;
 }
 
 export function buildDashboardExamplesPrompt(
@@ -744,7 +769,7 @@ SQL TEMPLATE REFERENCE:
 
   Available parameters by displayType:
     line / stacked_bar        startDate, endDate, interval (all available)
-    table / number / pie      startDate, endDate only (no interval)`;
+    table / number / pie / bar   startDate, endDate only (no interval)`;
 
   const preface =
     'Concrete dashboard examples for common observability patterns. ' +
@@ -916,6 +941,15 @@ For configType: "sql" tiles, write ClickHouse SQL with template macros:
     $__sourceTable             the source's \`database\`.\`table\`.
                                REQUIRES sourceId on the tile. Without it, the query fails to run.
 
+  VARIABLE MACROS (only resolve on a dashboard tile, see DASHBOARD VARIABLES):
+    $__filter(<expression>, $<var>)    Matches the expression against the variable's selected
+                                       values (e.g \`<expression> IN ('a', 'b')\`). Expands to
+                                       1=1 when nothing is selected.
+    $__conditionalAll(<cond>, $<var>)  Applies the condition only while the variable has a
+                                       selection, and expands to 1=1 otherwise. Use it for
+                                       operators IN cannot express, such as NOT IN or LIKE.
+    The variable argument carries the leading $, exactly as a bare reference would.
+
   QUERY PARAMETERS (ClickHouse parameterized syntax):
     {startDateMilliseconds:Int64}
     {endDateMilliseconds:Int64}
@@ -945,12 +979,13 @@ For configType: "sql" tiles, write ClickHouse SQL with template macros:
     ORDER BY request_count DESC
     LIMIT 50
 
-  IMPORTANT: Always include a LIMIT clause in table / number / pie SQL queries.
+  IMPORTANT: Always include a LIMIT clause in table / number / pie / bar SQL queries.
 
 == PER-TILE TYPE CONSTRAINTS ==
 
   number       Exactly 1 select item. No groupBy.
-  pie          Exactly 1 select item. groupBy defines the slices. Keep slice count under 8.
+  pie          Exactly 1 select item. groupBy defines the slices. Keep slice count under 8. Set the optional limit field (SQL LIMIT keeping the top-N groups by value) when the groupBy is high-cardinality.
+  bar          Exactly 1 select item. groupBy defines the bars. Not a time series (use stacked_bar for that). Optional limit field keeps the top-N groups by value.
   line         1 to 20 select items. Optional groupBy splits into series. Each select item may carry its own numberFormat.
   stacked_bar  1 to 20 select items. Optional groupBy splits into stacks.
   table        1 to 20 select items. Optional groupBy defines row groups. Per-series numberFormat lets one column render as a duration while a sibling count column stays a plain number.
@@ -958,7 +993,32 @@ For configType: "sql" tiles, write ClickHouse SQL with template macros:
   search       No select items (select is a column list string). where is the filter.
   markdown     No select items. Set markdown field with content.
 
-NOTE: Authoring builder tiles on a metric source is not reliable today. The MCP select-item shape does not carry the metricName / metricType fields the metric query path needs, and a save with a metric sourceId may render in the UI as "Both table name and UUID are empty" even though the save itself succeeded. For metrics, use a raw SQL tile (configType: "sql") with explicit table reference. The standard tables that back a metric source are otel_metrics_gauge, otel_metrics_sum, and otel_metrics_histogram; clickstack_list_sources returns the metric source's metricTables map so you know which table holds which metric kind. Discovery: metric source schemas today do NOT publish mapAttributeKeys for ResourceAttributes / Attributes the way log and trace sources do, so attribute keys must be discovered by sampling (SELECT DISTINCT mapKeys(Attributes) FROM ...).
+== METRIC SOURCES ==
+
+Builder tiles work on metric sources. Each select item on a metric tile MUST set metricType ("gauge" | "sum" | "histogram" | "exponential histogram") and metricName (the OTel metric name, e.g. "system.cpu.utilization"). valueExpression defaults to "Value" when omitted, so a typical metric series is { aggFn: "<fn>", metricType: "<kind>", metricName: "<name>" }. summary metrics are not supported by the renderer; to chart them, use a raw SQL tile (configType: "sql") against the table named in the source's metricTables.summary.
+
+Per-kind aggregation guidance:
+  gauge      Use aggFn:"last_value" | "avg" | "min" | "max". Set isDelta:true for Prometheus-style delta over each bucket.
+  sum        Use aggFn:"increase" for the per-bucket counter increase (reset-aware), or aggFn:"sum" | "avg" on the computed rate. increase + groupBy is capped at the top 20 groups by the renderer; pre-filter via where or pick a coarser groupBy when you need broader coverage.
+  histogram  Use aggFn:"quantile" with level ∈ {0.5, 0.9, 0.95, 0.99} for percentiles, or aggFn:"count" for the total bucket count. quantile without level is rejected.
+  exponential histogram  Use aggFn:"quantile" with level ∈ {0.5, 0.9, 0.95, 0.99} for percentiles, or aggFn:"count" for the total bucket count. quantile without level is rejected.
+
+Discovery workflow for metrics:
+  1. clickstack_list_sources: find the metric source ID and its metricTables map (which kinds are populated).
+  2. clickstack_describe_source(sourceId): returns columns, attribute keys, low-cardinality values, AND a per-kind metric-name sample (up to 20 names per kind).
+  3. clickstack_list_metrics(sourceId, ...): paginate the full metric catalog with optional kind + namePattern (ILIKE) + time-window filters. Pass nextCursor unchanged for the next page.
+  4. clickstack_describe_metric(sourceId, metricName): drill into a single metric: kind(s), unit, description, attribute keys per map column, and sampled values per attribute. Attribute keys vary per metric, not per source, so always call this before authoring tiles for a metric you've never queried.
+  5. clickstack_timeseries | clickstack_table: author the chart. Set metricType + metricName on each select item; pass the discovered attribute keys via groupBy / where.
+
+Examples:
+  Gauge p95-like spread by service (use last_value or avg):
+    { aggFn: "avg", metricType: "gauge", metricName: "system.cpu.utilization" }, groupBy: "ServiceName"
+  Sum counter increase:
+    { aggFn: "increase", metricType: "sum", metricName: "http.server.request.count", alias: "Requests" }, groupBy: "ServiceName"
+  Histogram p95 latency:
+    { aggFn: "quantile", level: 0.95, metricType: "histogram", metricName: "http.server.request.duration", alias: "P95 Latency" }, groupBy: "ServiceName"
+  Exponential histogram p95 latency:
+    { aggFn: "quantile", level: 0.95, metricType: "exponential histogram", metricName: "http.server.request.duration", alias: "P95 Latency" }, groupBy: "ServiceName"
 
 == NUMBER FORMAT ==
 
@@ -1002,7 +1062,24 @@ Colors are palette tokens, not hex. Order rules from least to most severe so the
     ]
   }
 
-colorRules is for number builder tiles only. Raw SQL number tiles (configType: "sql") support color but not colorRules.
+Both color and colorRules work on builder number tiles and on raw SQL number tiles (configType: "sql").
+
+== NUMBER TILE BACKGROUND CHART ==
+
+number tiles can show a faint background trend sparkline behind the value, derived from a time-bucketed version of the same query. Use it for SLO / error-budget tiles where the trend over the window matters as much as the current value. One field on the tile config:
+
+  backgroundChart  { type, color? }. type is "line" or "area". color is an optional palette token override; when unset the sparkline inherits the tile color.
+
+Example: an availability tile that shows the current value over a faint area trend:
+  config: {
+    displayType: "number",
+    sourceId: "...",
+    select: [{ aggFn: "avg", valueExpression: "Success", numberFormat: { output: "percent" } }],
+    color: "chart-green",
+    backgroundChart: { type: "area" }
+  }
+
+backgroundChart is for number builder tiles only. Raw SQL number tiles (configType: "sql") return a single value with no time dimension to bucket, so they do not support it.
 
 == asRatio ==
 
@@ -1014,20 +1091,84 @@ to plot the first as a ratio of the second. Useful for error rates:
   ],
   asRatio: true
 
+== FORMULAS (metric + log/trace sources) ==
+
+line / stacked_bar / table / number tiles on a METRIC, LOG, or TRACE source
+can add derived series computed from the select items via letter-ref
+arithmetic: "A" is select[0], "B" is select[1], and so on. The grammar is
++ - * /, parentheses, and numeric constants; division by zero or a missing
+operand renders as a gap. Example: a success-rate percentage over three
+metric counters:
+  select: [
+    { aggFn: "sum", metricType: "sum", metricName: "requests.success", alias: "Success" },
+    { aggFn: "sum", metricType: "sum", metricName: "requests.error", alias: "Error" },
+    { aggFn: "sum", metricType: "sum", metricName: "requests.fsi", alias: "FSI" }
+  ],
+  formulas: [
+    { expression: "A / (A + B + C) * 100", alias: "Success rate %", numberFormat: { output: "percent", mantissa: 1 } }
+  ]
+
+Example: an error-rate percentage on a log/trace source, from two filtered
+counts over the same rows:
+  select: [
+    { aggFn: "count", where: "SeverityText:error", alias: "Errors" },
+    { aggFn: "count", alias: "Total" }
+  ],
+  formulas: [
+    { expression: "A / B * 100", alias: "Error rate %" }
+  ]
+
+Rules:
+  - Metric, log, and trace sources only; the server rejects formulas on other
+    source kinds (e.g. session).
+  - Each formula adds one series after the operand series. Set
+    showOperandSeries: false to return only the formula series.
+  - Cannot be combined with asRatio: express the ratio as a formula ("A / B").
+  - number tiles support a single formula, display its value, and always hide
+    the operand series; their select items are the formula's operands.
+
 == DASHBOARD FILTERS ==
 
-Optional dashboard-level filter declarations. Each entry adds a dropdown to the dashboard header that scopes tiles against the filter's expression. Use this for focused per-dimension dashboards (per-service, per-tenant, per-endpoint) instead of hardcoding the dimension into every tile's where clause.
+Optional dashboard-level filter declarations. Each entry adds a dropdown to the dashboard header. Use this for focused per-dimension dashboards (per-service, per-tenant, per-endpoint) instead of hardcoding the dimension into every tile's where clause.
 
-Filter shape:
-  { type, name, expression, sourceId, where?, whereLanguage?, appliesToSourceIds? }
+Two filter types: QUERY_EXPRESSION queries its dropdown values from a source column, while STATIC_LIST declares them inline as a hand-authored options list and is always variable-only (see the static filter shape below).
 
-  type                 "QUERY_EXPRESSION" (the only currently supported type).
+A QUERY_EXPRESSION filter does one of two things with the value the user picks, or both:
+
+  BROADCAST (isBroadcastEnabled, ON by default)
+    The value is ANDed onto every in-scope tile automatically. Tiles need no wiring at all. This is the right choice in most cases.
+
+  VARIABLE (isVariableEnabled, OFF by default)
+    The value is exposed to tile queries as $variableName, and only the tiles that reference it are affected. See DASHBOARD VARIABLES below.
+
+Pick ONE. A filter with both modes on applies the value twice, once implicitly to every in-scope tile and once wherever a tile references it, which double-filters and is hard to reason about. Enable both only when you deliberately want the automatic scoping AND a tile that reads the raw value somewhere a plain AND cannot go, or when the variable is read only by another filter's dropdown query rather than by a tile (see DEPENDENT FILTERS).
+
+Query-expression filter shape:
+  { type: "QUERY_EXPRESSION", name, expression, sourceId, where?, whereLanguage?, appliesToSourceIds?, isBroadcastEnabled?, isVariableEnabled?, variableName? }
+
+  type                 "QUERY_EXPRESSION": the dropdown values are queried from a source column.
   name                 Human label shown in the filter dropdown (e.g. "Service").
   expression           Column or attribute path the filter scopes (e.g. "ServiceName" or "SpanAttributes['tenant.id']").
   sourceId             Which source the dropdown VALUES are queried from. Independent of which tiles get filtered (see appliesToSourceIds below).
-  where                Optional pre-filter that narrows the set of distinct values offered in the dropdown.
-  whereLanguage        "lucene" or "sql". Defaults to "lucene".
-  appliesToSourceIds   Optional list of source IDs the filter applies to. Omit (or pass undefined) to apply the filter to EVERY tile regardless of source (the recommended default). Pass a non-empty array to restrict the filter to tiles whose source is in that list, useful on mixed-source dashboards where the column only exists on some sources.
+  sourceMetricType     REQUIRED when sourceId is a Metric source. Picks which metric table the dropdown values come from.
+  where                Optional pre-filter that narrows the set of distinct values offered in the dropdown. It scopes only this dropdown, never a tile. May reference another filter's variable, which chains one dropdown off another (see DEPENDENT FILTERS below).
+  whereLanguage        "lucene" or "sql". Defaults to "sql", set it explicitly anyway.
+  appliesToSourceIds   Optional list of source IDs the BROADCAST condition applies to. Omit (or pass undefined) to apply it to EVERY tile regardless of source (the recommended default). Pass a non-empty array to restrict it to tiles whose source is in that list, useful on mixed-source dashboards where the column only exists on some sources. Rejected when isBroadcastEnabled is false, and it does NOT restrict which tiles may reference the variable.
+  isBroadcastEnabled   Omit or set to true to enable broadcasting. Set false for a variable-only filter.
+  isVariableEnabled    Set true to expose the value as $variableName.
+  variableName         The token tiles reference. Must match [a-zA-Z][a-zA-Z0-9_]* and be at most 64 characters, and must be unique across the dashboard's variable-enabled filters. Defaults to the display name with whitespace turned into underscores and remaining illegal characters dropped, so "Service Name" becomes $Service_Name and a label with nothing token-safe in it (a non-ASCII name, for instance) must set this field explicitly. Rejected when isVariableEnabled is not true.
+
+Static filter shape:
+  { type: "STATIC_LIST", name, options, variableName? }
+
+  options              1-1000 unique, non-empty strings the dropdown offers, in display order.
+
+  No expression, sourceId, where, or appliesToSourceIds: the list is hand-authored, nothing is queried. It has no mode flags either. A static filter is always variable-only, so tiles must reference $variableName for the selection to have any effect. Pass the column explicitly in macros ($__filter(<expression>, $<variableName>)); the one-argument $__filter($var) form fails because the filter has no expression of its own.
+
+Example (static list):
+  filters: [
+    { type: "STATIC_LIST", name: "Environment", options: ["prod", "staging", "dev"], variableName: "env" }
+  ]
 
 Example (broadcast to every tile, the common case):
   filters: [
@@ -1047,6 +1188,89 @@ Example (scoped to the trace source only on a mixed log/trace/metric dashboard):
 
 When a value is picked in the dropdown, the renderer combines it with each in-scope tile's existing where clause via AND. Tiles do NOT need to reference the filter name; matching the scope (or no scope set) is enough.
 
+== DASHBOARD VARIABLES ==
+
+A filter with isVariableEnabled: true publishes its selected value to tile queries under variableName. STATIC_LIST filters are always variable-enabled, so every one of them publishes its selection this way. Nothing happens until a tile references it: variables are opt-in per tile, while broadcast is automatic.
+
+REACH FOR A VARIABLE WHEN BROADCAST CANNOT DO THE JOB. Broadcast plus a builder tile covers the ordinary "scope this dashboard to one service" case with no per-tile wiring and no way to get it wrong. A variable is worth the extra plumbing when:
+  - the predicate is not a plain equality (NOT IN, LIKE, a regex match, a range)
+  - the value has to appear somewhere a WHERE condition cannot go (inside a CTE, a SELECT expression, a JOIN condition, an argument to a function)
+  - different tiles need to apply the same picked value against different columns
+  - the dashboard mixes sources that do not share the column, so a broadcast filter would inject a column that half the tiles do not have
+
+THREE WAYS TO REFERENCE A VARIABLE
+
+  $__filter(<expression>, $<variableName>)
+    The default choice, in SQL. Expands to (<expression> IN ('a', 'b')) when values are selected and to 1=1 when nothing is, so the tile shows everything on a freshly-opened dashboard instead of going blank.
+      where: "$__filter(ServiceName, $service)"
+    The one-argument form $__filter($service) reuses the filter's own expression, but it fails when the filter does not carry one, so pass the expression explicitly whenever the tile's column differs from the filter's.
+
+  $__conditionalAll(<condition>, $<variableName>)
+    Applies the condition verbatim while something is selected, and 1=1 otherwise. Use it for anything IN cannot express. The condition itself should reference the variable.
+      where: "$__conditionalAll(ServiceName NOT IN ($service), $service)"
+
+  $variableName / \${variableName} / \${variableName:format}
+    The raw value. In a SQL input, only reach for this when you need the value in a position a predicate cannot occupy: outside a $__filter or $__conditionalAll guard the default sqlstring format renders as NULL when nothing is selected, so "ServiceName IN ($service)" matches zero rows before the user picks anything. In a LUCENE input it is the only form available and it needs no guard: the lucene format renders ("") for an empty selection, which the translator drops to a match-all, so "ServiceName:$service" returns everything until the user picks a service.
+
+FORMAT SPECIFIERS
+
+Only add one when the default is wrong. \${service:sqlstring} is redundant in a SQL input.
+
+  Format     Example Output       Empty state
+  sqlstring  'a', 'b'             NULL        the default in SQL inputs
+  lucene     ("a" OR "b")         ("")        the default in Lucene inputs; ("") is a match-all, so no guard is needed
+  regex      (a|b)                .*          use with match()
+  csv        a,b                  <empty>     use INSIDE a string literal
+
+BUILDER TILES
+
+Every expression on a builder tile accepts variable references, in either language. The two MACROS additionally work in every SQL-language expression: a select item's where, the tile-level where on search / heatmap / event_patterns tiles, having, groupBy, and orderBy. There is no tile-level where on table / line / stacked_bar / number / pie / bar tiles, so those carry the macro on each select item. Set whereLanguage: "sql" on whichever input carries one.
+  select: [{ aggFn: "count", whereLanguage: "sql", where: "$__filter(ServiceName, $service)", alias: "Requests" }]
+  select: [{ aggFn: "count", whereLanguage: "sql", where: "$__conditionalAll(SpanName NOT IN ($endpoint), $endpoint)", alias: "Other endpoints" }]
+  having: "$__filter(SpanName, $endpoint)"   (post-aggregation, on a groupBy column)
+  where: "$__filter(ServiceName, $service)", whereLanguage: "sql"   (search / heatmap / event_patterns tiles)
+
+In a LUCENE input the macros have no meaning and are matched as literal text. Reference the variable directly instead, which renders in the lucene format and needs no guard: with nothing selected it becomes ServiceName:("") and the translator drops that to a match-all, so the tile returns everything rather than going empty.
+  select: [{ aggFn: "count", whereLanguage: "lucene", where: "ServiceName:$service" }]
+When in doubt on a variable-driven tile, set whereLanguage: "sql" and use $__filter.
+
+RAW SQL TILES (for advanced use-cases only)
+
+  SELECT $__timeInterval(Timestamp) AS ts, count() AS errors
+  FROM $__sourceTable
+  WHERE $__timeFilter(Timestamp)
+    AND $__filters
+    AND $__filter(ServiceName, $service)
+    AND $__conditionalAll(SpanName NOT IN (\${endpoint}), $endpoint)
+  GROUP BY ts
+  ORDER BY ts
+
+$__filters (plural) and $__filter (singular) are different macros. $__filters applies the BROADCAST filters with no arguments. $__filter takes an expression and a $-prefixed variable name.
+
+DEPENDENT FILTERS
+
+A filter's own \`where\` can reference another filter's variable, which chains one dropdown off another: pick a service, and the Endpoint dropdown lists only that service's endpoints. The \`where\` scopes the values THAT dropdown offers and is never applied to a tile, so the upstream filter can keep broadcasting; only the upstream filter needs isVariableEnabled: true.
+
+  filters: [
+    { type: "QUERY_EXPRESSION", name: "Service", expression: "ServiceName",
+      sourceId: "<trace-source-id>", whereLanguage: "sql",
+      isVariableEnabled: true, variableName: "service" },
+    { type: "QUERY_EXPRESSION", name: "Endpoint", expression: "SpanName",
+      sourceId: "<trace-source-id>", whereLanguage: "sql",
+      where: "$__filter(ServiceName, $service)" }
+  ]
+
+Use $__filter here for the same reason a tile does: it expands to 1=1 with nothing selected, so the Endpoint dropdown lists every endpoint until a service is picked. A bare reference (where: "ServiceName IN ($service)") renders as NULL instead, leaving the dropdown empty until the upstream filter is set. That is occasionally what you want ("pick a service first"), and the UI labels such a dropdown as depending on $service, but make it a deliberate choice.
+
+Reference a SIBLING filter's variable only. A filter whose \`where\` names its own variable narrows its dropdown to the values already picked, so the remaining options disappear from a multi-select.
+
+VALIDATING
+
+clickstack_query_tile and clickstack_query_tiles expand variables with an EMPTY selection by default, which is what a freshly-opened dashboard looks like. Optionally, pass variableValues to check that a tile narrows correctly once something is picked:
+  variableValues: [{ name: "service", values: ["checkout"] }]
+For a STATIC_LIST filter's variable, every supplied value must be one of the filter's declared options; the dashboard UI can never select anything else, so other values are rejected.
+Both tools report variable problems under "warnings". Alerts on a tile always evaluate with every variable empty, so a tile carrying an alert must stay correct with nothing selected.
+
 == TABLE TILE LINKING (config.onClick) ==
 
 Table tiles can wire up row-click navigation via config.onClick. Builder table tiles (displayType: "table") and raw-SQL tiles (configType: "sql", displayType: "table") both accept this; other tile types ignore it.
@@ -1056,6 +1280,8 @@ Destination types:
     Opens the /search page for a log or trace source. Metric and session sources are rejected by the server (the /search page does not render those kinds).
   { type: "dashboard", target, whereLanguage, whereTemplate?, filters? }
     Opens another ClickStack dashboard owned by the same team.
+  { type: "external",  urlTemplate }
+    Opens an arbitrary external URL in a new tab (e.g. a Grafana or Langfuse dashboard, a runbook). The urlTemplate is rendered against the clicked row and the rendered value must be an absolute http(s) URL. It takes no target, whereLanguage, whereTemplate, or filters, and references no ClickStack source or dashboard.
 
 Target shape, how the destination is identified:
   target: { mode: "id", id: "<object-id>" }
@@ -1115,6 +1341,12 @@ Example, destination chosen by the clicked row (rare; prefer mode="id"):
     "type": "dashboard",
     "target": { "mode": "template", "template": "{{TargetDashboardName}}" },
     "whereLanguage": "lucene"
+  }
+
+Example, link out to an external tool:
+  "onClick": {
+    "type": "external",
+    "urlTemplate": "https://grafana.example.com/d/abc?var-service={{ServiceName}}"
   }
 
 Validation rules the server enforces:
@@ -1251,7 +1483,7 @@ Example: find top patterns for production services over the last 4 hours:
    Correct: groupBy: "SpanAttributes['http.method']"
    NOTE: JSON-type columns DO use dot notation. Check jsType from clickstack_describe_source.
 
-4. Multiple select items on number / pie / heatmap tiles
+4. Multiple select items on number / pie / bar / heatmap tiles
    Wrong:   displayType: "number", select: [{ aggFn: "count" }, { aggFn: "avg", ... }]
    Correct: displayType: "number", select: [{ aggFn: "count" }]
    Note: clickstack_table (the query tool) auto-upgrades shape:"number" to "table" when select has >1 item; dashboard tiles do not.
@@ -1271,7 +1503,7 @@ Example: find top patterns for production services over the last 4 hours:
    The dashboard filter applies globally; tiles do not need the literal. On mixed-source dashboards where only some tiles carry the column, add appliesToSourceIds: ["<id>", ...] to scope the filter to just those sources instead of breaking the unrelated tiles.
 
 8. Forgetting to validate tiles after saving
-   Always call clickstack_query_tile on EVERY tile after clickstack_save_dashboard, not just one. Save validates input shape but not query semantics. Several known gaps (Lucene comparison/wildcard on map attributes, builder tiles on metric sources, malformed having) pass save and fail at render time. A dashboard with one bad tile renders the whole page in a degraded state; the user sees "Error loading chart" with no way to know which tile broke unless you validated. If query_tile returns an error, fix the where / SQL and re-save before declaring the dashboard ready.
+   Always call clickstack_query_tile on EVERY tile after clickstack_save_dashboard, not just one. Save validates input shape but not query semantics. Several known gaps (Lucene comparison/wildcard on map attributes, malformed having) pass save and fail at render time. A dashboard with one bad tile renders the whole page in a degraded state; the user sees "Error loading chart" with no way to know which tile broke unless you validated. If query_tile returns an error, fix the where / SQL and re-save before declaring the dashboard ready.
 
 9. Using connectionId with builder tiles, or omitting connectionId or sourceId on a single-table SQL tile
    Builder tiles (line, table, etc.) use sourceId (no connectionId).
@@ -1323,7 +1555,7 @@ Example: find top patterns for production services over the last 4 hours:
 17. onClick on a non-table tile
     Only table tiles (builder displayType: "table" and raw-SQL configType: "sql"
     with displayType: "table") support config.onClick. Other displayTypes
-    ignore the field. Putting onClick on a line/number/pie/heatmap/search/markdown
+    ignore the field. Putting onClick on a line/number/pie/bar/heatmap/search/markdown
     tile won't error but won't do anything either.
 
 18. onClick targeting a non-log/trace source for type="search"
@@ -1345,6 +1577,39 @@ Example: find top patterns for production services over the last 4 hours:
     and aliases both work). For map-attribute groupBys, see GROUPBY ALIASES
     AND ROW-CLICK TEMPLATES; builder tiles do not alias map-attribute
     columns cleanly, so you need a raw SQL tile with explicit AS.
+
+21. Making one filter both broadcast and variable enabled
+    A filter with isBroadcastEnabled left on AND isVariableEnabled: true
+    applies the picked value twice, once implicitly to every in-scope tile
+    and once wherever a tile references it. Pick one mode. Set
+    isBroadcastEnabled: false when you add isVariableEnabled: true. The
+    exception is a variable read only by another filter's where (a dependent
+    dropdown): that value never reaches a tile, so broadcasting stays correct.
+
+22. Broadcasting one filter across incompatible sources
+    A broadcast filter with no appliesToSourceIds is ANDed onto EVERY tile,
+    including tiles whose source has no such column, which fails at query
+    time. On a mixed log/trace/metric dashboard either scope it with
+    appliesToSourceIds, or switch it to a variable and reference it only
+    from the tiles that can use it.
+
+23. A bare $var instead of $__filter or $__conditionalAll
+    Wrong:   where: "ServiceName IN ($service)"
+    Correct: where: "$__filter(ServiceName, $service)"
+    In the default sqlstring format a bare reference renders as NULL when
+    nothing is selected, so the tile shows zero rows on a freshly-opened
+    dashboard. The macros expand to 1=1 instead.
+
+24. A variable macro in a Lucene input
+    $__filter and $__conditionalAll have no meaning in Lucene and are
+    matched as literal text. Set whereLanguage: "sql" and use the macro, or
+    keep Lucene and write ServiceName:$service.
+
+25. Chaining one filter's dropdown off a filter that is not variable-enabled
+    A dependent filter's where can only read a variable that some filter
+    publishes. The UPSTREAM filter needs isVariableEnabled: true (plus its
+    variableName); the downstream one does not. Without it there is no
+    $service token and the downstream dropdown is never scoped.
 
 == REFERENCES ==
 

@@ -242,7 +242,7 @@ export default function AuthPage({ action }: { action: 'register' | 'login' }) {
                 <Button
                   component="a"
                   href={ssoConfig.loginPath}
-                  variant="default"
+                  variant="secondary"
                   size="md"
                   fullWidth
                   data-test-id="sso-login"

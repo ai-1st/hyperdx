@@ -1,8 +1,13 @@
 import { useCallback, useEffect, useMemo } from 'react';
 import { Controller, useForm, useWatch } from 'react-hook-form';
 import {
+  UnknownTemplateHelperError,
+  validateTemplate,
+} from '@hyperdx/common-utils/dist/core/handlebarsEnv';
+import {
   ChartConfigWithDateRange,
   DisplayType,
+  MAX_LEGEND_TEMPLATE_LENGTH,
   NumberFormat,
 } from '@hyperdx/common-utils/dist/types';
 import {
@@ -19,9 +24,10 @@ import {
 } from '@mantine/core';
 
 import { shouldFillNullsWithZero } from '@/ChartUtils';
-import { DEFAULT_SERIES_LIMIT } from '@/defaults';
+import { MAX_RENDERED_TIME_CHART_SERIES } from '@/defaults';
 import { FormatTime } from '@/useFormatTime';
 
+import { BackgroundChartInput } from './BackgroundChartInput';
 import {
   attachLocalIds,
   ColorRulesEditor,
@@ -29,7 +35,7 @@ import {
   stripLocalIds,
 } from './ColorRulesEditor';
 import { ColorSwatchInput } from './ColorSwatchInput';
-import { CheckBoxControlled } from './InputControlled';
+import { CheckBoxControlled, TextInputControlled } from './InputControlled';
 import { DEFAULT_NUMBER_FORMAT, NumberFormatForm } from './NumberFormat';
 
 export type ChartConfigDisplaySettings = Pick<
@@ -41,13 +47,20 @@ export type ChartConfigDisplaySettings = Pick<
   | 'fitYAxisToData'
   | 'color'
   | 'colorRules'
+  | 'backgroundChart'
 > & {
   groupByColumnsOnLeft?: boolean;
-  // Per-tile cap on the number of series fetched for a group-by time chart.
-  // null/undefined = disabled (no __hdx_series_limit CTE; every series is
-  // fetched). The editor clears to `null` (not `undefined`) so the cleared
-  // state survives JSON round-tripping through the URL query state.
+  alternateRowBackground?: boolean;
+  // Per-tile series cap. On builder group-by/pie/bar charts it's a fetch cap
+  // (the __hdx_series_limit CTE / a SQL LIMIT); on raw SQL time charts it's a
+  // client-side render cap only. Three-state: null/undefined = default cap,
+  // 0 = unlimited, positive N = top N. See SharedChartSettingsSchema.seriesLimit
+  // for the authoritative semantics. The editor clears to `null` (not
+  // `undefined`) so the cleared state survives JSON round-tripping via the URL.
   seriesLimit?: number | null;
+  // PromQL-only: Handlebars template over each series' Prometheus label set
+  // that renders the legend/tooltip name.
+  legendTemplate?: string;
 };
 
 /**
@@ -68,7 +81,7 @@ interface ChartDisplaySettingsDrawerProps {
   /** 'sql' for raw SQL chart configs; anything else is treated as a builder config. */
   configType?: 'sql' | 'builder' | 'promql';
   previousDateRange?: [Date, Date];
-  onChange: (settings: ChartConfigDisplaySettings) => void;
+  onChange: (settings: ChartConfigDisplaySettings, isDirty: boolean) => void;
   onClose: () => void;
   isPerSeriesNumberFormatAllowed?: boolean;
 }
@@ -88,13 +101,16 @@ function applyDefaultSettings(
     compareToPreviousPeriod: settings.compareToPreviousPeriod ?? false,
     fitYAxisToData: settings.fitYAxisToData ?? false,
     groupByColumnsOnLeft: settings.groupByColumnsOnLeft ?? false,
+    alternateRowBackground: settings.alternateRowBackground ?? false,
     // Coerce to null so `reset` clears the input; undefined leaves the
     // previously registered field value in place.
     seriesLimit: settings.seriesLimit ?? null,
+    legendTemplate: settings.legendTemplate ?? '',
     color: settings.color,
     colorRules: settings.colorRules
       ? attachLocalIds(settings.colorRules)
       : undefined,
+    backgroundChart: settings.backgroundChart,
   };
 }
 
@@ -114,7 +130,13 @@ export default function ChartDisplaySettingsDrawer({
     [settings, defaultNumberFormat],
   );
 
-  const { control, handleSubmit, reset, setValue } = useForm<DrawerFormValues>({
+  const {
+    control,
+    handleSubmit,
+    reset,
+    setValue,
+    formState: { dirtyFields },
+  } = useForm<DrawerFormValues>({
     defaultValues: appliedDefaults,
   });
 
@@ -134,13 +156,28 @@ export default function ChartDisplaySettingsDrawer({
     handleSubmit(formValues => {
       // Strip client-side localIds before passing rules to the config.
       const { colorRules, ...rest } = formValues;
-      onChange({
-        ...rest,
-        colorRules: colorRules ? stripLocalIds(colorRules) : undefined,
-      });
+      // Persist numberFormat only when the user actually chose one: either the
+      // tile already had an explicit override (settings.numberFormat) or the
+      // user changed the format control in this session (dirtyFields). Otherwise
+      // emit undefined so the datasource-derived format keeps driving render
+      // instead of freezing the drawer's inferred fallback into the config.
+      const numberFormatExplicit =
+        settings.numberFormat != null || dirtyFields.numberFormat != null;
+      const hasDirtyFields = Object.keys(dirtyFields).length > 0;
+      onChange(
+        {
+          ...rest,
+          numberFormat: numberFormatExplicit
+            ? formValues.numberFormat
+            : undefined,
+          colorRules: colorRules ? stripLocalIds(colorRules) : undefined,
+        },
+        hasDirtyFields,
+      );
+      // Close only on successful validation
+      onClose();
     })();
-    onClose();
-  }, [onChange, handleSubmit, onClose]);
+  }, [onChange, handleSubmit, onClose, settings.numberFormat, dirtyFields]);
 
   const resetToDefaults = useCallback(() => {
     reset(
@@ -154,19 +191,44 @@ export default function ChartDisplaySettingsDrawer({
   const isTimeChart =
     displayType === DisplayType.Line || displayType === DisplayType.StackedBar;
 
-  // The series-limit CTE is only emitted for builder group-by time charts;
-  // raw SQL configs author their own LIMIT logic directly.
-  const showSeriesLimit = isTimeChart && configType !== 'sql';
+  // Series Limit applies to every time chart. On builder group-by charts a
+  // positive value drives the __hdx_series_limit SQL CTE (trimming what's
+  // fetched); on raw SQL it drives the client-side render cap in
+  // `formatResponseForTimeChart` (raw SQL can't inject the CTE). PromQL is
+  // excluded — its series come from Prometheus, not this pipeline.
+  const showSeriesLimit = isTimeChart && configType !== 'promql';
+  const isRawSqlTimeChart = showSeriesLimit && configType === 'sql';
 
-  // Group By column ordering only applies to builder table charts; raw SQL
-  // configs let the user author whatever column order they want directly.
-  const showGroupByColumnsOnLeft =
-    displayType === DisplayType.Table && configType !== 'sql';
+  // Every PromQL display except Number surfaces the series name
+  const showLegendTemplate =
+    configType === 'promql' && displayType !== DisplayType.Number;
+
+  // On pie/bar builder charts, seriesLimit becomes a plain SQL LIMIT on the
+  // number of slices/bars; raw SQL configs author their own LIMIT directly.
+  const isCategoricalChart =
+    displayType === DisplayType.Pie || displayType === DisplayType.Bar;
+  const showCategoricalLimit =
+    isCategoricalChart && configType !== 'sql' && configType !== 'promql';
+
+  // Table display options. Alternate Row Background is purely presentational
+  // (it stripes rendered rows), so it applies to any table tile. Group By
+  // column ordering needs the builder `select` structure to know which columns
+  // are group-by keys, so it stays builder-only.
+  const showTableOptions = displayType === DisplayType.Table;
+  const showGroupByColumnsOnLeft = showTableOptions && configType !== 'sql';
 
   // Tile-level color is only meaningful for number tiles today.
   // Per-series colors on line / bar / pie ship in a follow-up PR via
   // `select[i].color`.
   const showTileColor = displayType === DisplayType.Number;
+
+  // The background sparkline is derived from a time-bucketed version of the
+  // tile's query, so it only applies to builder number tiles: raw SQL number
+  // tiles return a single value with no time dimension to bucket. On a SQL
+  // number tile the control is shown disabled with a hint rather than hidden,
+  // so the option stays discoverable.
+  const showBackgroundChart = displayType === DisplayType.Number;
+  const isBackgroundChartDisabled = configType === 'sql';
 
   return (
     <Drawer
@@ -226,9 +288,13 @@ export default function ChartDisplaySettingsDrawer({
                     <NumberInput
                       size="xs"
                       label="Series Limit"
-                      description="Maximum number of series fetched for a group-by chart. Leave empty to fetch every series."
-                      placeholder={`Disabled (e.g. ${DEFAULT_SERIES_LIMIT})`}
-                      min={1}
+                      description={
+                        isRawSqlTimeChart
+                          ? `Maximum number of series rendered, keeping those with the largest values. Leave empty for the default (${MAX_RENDERED_TIME_CHART_SERIES}); set 0 for unlimited.`
+                          : `Maximum number of series fetched for a group-by chart, keeping those with the largest values. Leave empty for the default (${MAX_RENDERED_TIME_CHART_SERIES}); set 0 for unlimited.`
+                      }
+                      placeholder={`Default (${MAX_RENDERED_TIME_CHART_SERIES})`}
+                      min={0}
                       allowDecimal={false}
                       value={value ?? ''}
                       onChange={v =>
@@ -243,13 +309,81 @@ export default function ChartDisplaySettingsDrawer({
           </>
         )}
 
-        {showGroupByColumnsOnLeft && (
+        {showLegendTemplate && (
           <>
+            <Box>
+              <TextInputControlled
+                control={control}
+                name="legendTemplate"
+                size="xs"
+                label="Legend template"
+                description="Handlebars template rendered with each series' Prometheus labels. Leave empty for the default legend. Additional labels will be added if the template does not produce unique labels for each series."
+                placeholder="e.g. {{namespace}} - {{pod}}"
+                data-testid="legend-template-input"
+                rules={{
+                  validate: value => {
+                    if (typeof value !== 'string' || !value) return true;
+                    const trimmed = value.trim();
+                    if (trimmed.length > MAX_LEGEND_TEMPLATE_LENGTH) {
+                      return `Template is too long (${trimmed.length} characters, max ${MAX_LEGEND_TEMPLATE_LENGTH})`;
+                    }
+                    try {
+                      validateTemplate(trimmed);
+                      return true;
+                    } catch (err) {
+                      return err instanceof UnknownTemplateHelperError
+                        ? err.message
+                        : 'Invalid Handlebars template';
+                    }
+                  },
+                }}
+              />
+            </Box>
+            <Divider />
+          </>
+        )}
+
+        {showCategoricalLimit && (
+          <>
+            <Box>
+              <Controller
+                control={control}
+                name="seriesLimit"
+                render={({ field: { onChange, value } }) => (
+                  <NumberInput
+                    size="xs"
+                    label="Series Limit"
+                    description="Maximum number of values displayed, keeping those with the largest values. Leave empty to fetch all."
+                    placeholder="Disabled (e.g. 10)"
+                    min={1}
+                    allowDecimal={false}
+                    value={value ?? ''}
+                    onChange={v =>
+                      onChange(v === '' || v == null ? null : Number(v))
+                    }
+                  />
+                )}
+              />
+            </Box>
+            <Divider />
+          </>
+        )}
+
+        {showTableOptions && (
+          <>
+            {showGroupByColumnsOnLeft && (
+              <CheckBoxControlled
+                control={control}
+                name="groupByColumnsOnLeft"
+                size="xs"
+                label="Display Group By Columns on Left"
+              />
+            )}
             <CheckBoxControlled
               control={control}
-              name="groupByColumnsOnLeft"
+              name="alternateRowBackground"
               size="xs"
-              label="Display Group By Columns on Left"
+              label="Alternate Row Background"
             />
             <Divider />
           </>
@@ -286,6 +420,23 @@ export default function ChartDisplaySettingsDrawer({
           </>
         )}
 
+        {showBackgroundChart && (
+          <>
+            <Controller
+              control={control}
+              name="backgroundChart"
+              render={({ field: { onChange, value } }) => (
+                <BackgroundChartInput
+                  value={value}
+                  onChange={onChange}
+                  disabled={isBackgroundChartDisabled}
+                />
+              )}
+            />
+            <Divider />
+          </>
+        )}
+
         <NumberFormatForm
           control={control}
           setValue={setValue}
@@ -304,7 +455,12 @@ export default function ChartDisplaySettingsDrawer({
           <Button type="submit" variant="secondary" onClick={resetToDefaults}>
             Reset to Defaults
           </Button>
-          <Button type="submit" variant="primary" onClick={applyChanges}>
+          <Button
+            type="submit"
+            variant="primary"
+            onClick={applyChanges}
+            data-testid="display-settings-apply-button"
+          >
             Apply
           </Button>
         </Group>

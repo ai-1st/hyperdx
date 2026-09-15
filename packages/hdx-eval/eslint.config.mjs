@@ -27,9 +27,10 @@ export default [
       prettier: prettierPlugin,
     },
     rules: {
+      '@typescript-eslint/ban-ts-comment': 'error',
       '@typescript-eslint/no-explicit-any': 'off',
       '@typescript-eslint/no-unused-vars': [
-        'warn',
+        'error',
         {
           argsIgnorePattern: '^_',
           varsIgnorePattern: '^_',
@@ -38,6 +39,18 @@ export default [
       'prettier/prettier': 'error',
       'simple-import-sort/imports': 'error',
       'simple-import-sort/exports': 'error',
+      'no-restricted-imports': [
+        'error',
+        {
+          patterns: [
+            {
+              regex: '^\\.\\.(/|$)',
+              message:
+                'Use the @/ path alias instead of parent-relative imports (../).',
+            },
+          ],
+        },
+      ],
     },
     languageOptions: {
       parser: tseslint.parser,

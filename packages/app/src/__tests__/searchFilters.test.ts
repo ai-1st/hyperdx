@@ -6,9 +6,11 @@ import {
   areFiltersEqual,
   parseQuery,
   useSearchPageFilterState,
-} from '../searchFilters';
+} from '@/searchFilters';
 
 enableMapSet();
+
+type ConditionFilter = { type: 'sql' | 'lucene'; condition: string };
 
 describe('searchFilters', () => {
   describe('parseQuery', () => {
@@ -470,6 +472,147 @@ describe('searchFilters', () => {
         },
       });
     });
+
+    // Dashboard filters can be defined by an arbitrary expression, not just a
+    // bare column. The parser must treat the whole expression as the key and
+    // ignore operators/keywords nested inside its parentheses.
+    describe('complex expression keys', () => {
+      const ifExpr = `if(SeverityText = 'error' or SeverityText = 'fatal', 'Errors', 'Non-errors')`;
+      const ifWithInExpr = `if(SeverityText IN ('error', 'fatal'), 'Errors', 'Non-errors')`;
+
+      it('keeps the whole expression as the key when it contains OR and = inside parens', () => {
+        const result = parseQuery([
+          { type: 'sql', condition: `${ifExpr} IN ('Errors')` },
+        ]);
+        expect(result.filters).toEqual({
+          [ifExpr]: {
+            included: new Set(['Errors']),
+            excluded: new Set(),
+          },
+        });
+      });
+
+      it('splits on the outer IN, not the IN nested inside the expression', () => {
+        const result = parseQuery([
+          { type: 'sql', condition: `${ifWithInExpr} IN ('Errors')` },
+        ]);
+        expect(result.filters).toEqual({
+          [ifWithInExpr]: {
+            included: new Set(['Errors']),
+            excluded: new Set(),
+          },
+        });
+      });
+
+      it('parses multiple selected values on an expression key', () => {
+        const result = parseQuery([
+          {
+            type: 'sql',
+            condition: `${ifExpr} IN ('Errors', 'Non-errors')`,
+          },
+        ]);
+        expect(result.filters).toEqual({
+          [ifExpr]: {
+            included: new Set(['Errors', 'Non-errors']),
+            excluded: new Set(),
+          },
+        });
+      });
+
+      it('parses NOT IN on an expression key without splitting on nested IN', () => {
+        const result = parseQuery([
+          { type: 'sql', condition: `${ifWithInExpr} NOT IN ('Errors')` },
+        ]);
+        expect(result.filters).toEqual({
+          [ifWithInExpr]: {
+            included: new Set(),
+            excluded: new Set(['Errors']),
+          },
+        });
+      });
+
+      it('parses included and excluded selections on the same expression key', () => {
+        const result = parseQuery([
+          { type: 'sql', condition: `${ifExpr} IN ('Errors')` },
+          { type: 'sql', condition: `${ifExpr} NOT IN ('Non-errors')` },
+        ]);
+        expect(result.filters).toEqual({
+          [ifExpr]: {
+            included: new Set(['Errors']),
+            excluded: new Set(['Non-errors']),
+          },
+        });
+      });
+
+      it('extracts an expression clause from an AND-joined compound condition', () => {
+        const result = parseQuery([
+          {
+            type: 'sql',
+            condition: `ServiceName IN ('api') AND ${ifExpr} IN ('Errors')`,
+          },
+        ]);
+        expect(result.filters).toEqual({
+          ServiceName: {
+            included: new Set(['api']),
+            excluded: new Set(),
+          },
+          [ifExpr]: {
+            included: new Set(['Errors']),
+            excluded: new Set(),
+          },
+        });
+      });
+
+      it('does not split on AND nested inside an expression key', () => {
+        const betweenExpr = `if(Duration BETWEEN 1 AND 2, 'fast', 'slow')`;
+        const result = parseQuery([
+          { type: 'sql', condition: `${betweenExpr} IN ('fast')` },
+        ]);
+        expect(result.filters).toEqual({
+          [betweenExpr]: {
+            included: new Set(['fast']),
+            excluded: new Set(),
+          },
+        });
+      });
+
+      it('does not treat a BETWEEN nested inside an expression key as a range', () => {
+        const betweenExpr = `if(Duration BETWEEN 1 AND 2, 'fast', 'slow')`;
+        const result = parseQuery([
+          { type: 'sql', condition: `${betweenExpr} NOT IN ('slow')` },
+        ]);
+        expect(result.filters).toEqual({
+          [betweenExpr]: {
+            included: new Set(),
+            excluded: new Set(['slow']),
+          },
+        });
+      });
+
+      it('handles a nested function expression key', () => {
+        const key = `toString(multiIf(Status >= 500, 'error', Status >= 400, 'warn', 'ok'))`;
+        const result = parseQuery([
+          { type: 'sql', condition: `${key} IN ('error', 'warn')` },
+        ]);
+        expect(result.filters).toEqual({
+          [key]: {
+            included: new Set(['error', 'warn']),
+            excluded: new Set(),
+          },
+        });
+      });
+
+      it('round-trips an expression key through filtersToQuery', () => {
+        const originalFilters = {
+          [ifExpr]: {
+            included: new Set<string | boolean>(['Errors']),
+            excluded: new Set<string | boolean>(['Non-errors']),
+          },
+        };
+        const query = filtersToQuery(originalFilters);
+        expect(parseQuery(query).filters).toEqual(originalFilters);
+      });
+    });
   });
 
   describe('areFiltersEqual', () => {
@@ -630,6 +773,197 @@ describe('searchFilters', () => {
     });
   });
 
+  describe('round-trip: DateTime columns', () => {
+    const dateTimeColumns = new Map<string, string>([
+      ['Timestamp', 'DateTime64(9)'],
+      ['TimestampTime', 'DateTime'],
+    ]);
+
+    it('round-trips an excluded DateTime value (no areFiltersEqual reset)', () => {
+      const originalFilters = {
+        Timestamp: {
+          included: new Set<string | boolean>(),
+          excluded: new Set<string | boolean>([
+            '2026-06-16T15:35:16.731000000Z',
+          ]),
+        },
+      };
+
+      const query = filtersToQuery(originalFilters, { dateTimeColumns });
+      const parsed = parseQuery(query);
+
+      expect(parsed.filters).toEqual({
+        Timestamp: {
+          included: new Set(),
+          excluded: new Set(['2026-06-16T15:35:16.731000000Z']),
+        },
+      });
+    });
+
+    it('round-trips an included DateTime value with multiple entries', () => {
+      const originalFilters = {
+        Timestamp: {
+          included: new Set<string | boolean>(['2026-06-16', '2026-06-17']),
+          excluded: new Set<string | boolean>(),
+        },
+      };
+
+      const query = filtersToQuery(originalFilters, { dateTimeColumns });
+      const parsed = parseQuery(query);
+
+      expect(parsed.filters).toEqual({
+        Timestamp: {
+          included: new Set(['2026-06-16', '2026-06-17']),
+          excluded: new Set(),
+        },
+      });
+    });
+
+    it('parseQuery unwraps the DateTime wrapper independently of the producer', () => {
+      const parsed = parseQuery([
+        {
+          type: 'sql',
+          condition:
+            "Timestamp NOT IN (parseDateTime64BestEffort('a', 9), parseDateTime64BestEffort('b', 9))",
+        },
+      ]);
+
+      expect(parsed.filters).toEqual({
+        Timestamp: {
+          included: new Set(),
+          excluded: new Set(['a', 'b']),
+        },
+      });
+    });
+
+    it('unwraps the DateTime part of a compound AND condition', () => {
+      const parsed = parseQuery([
+        {
+          type: 'sql',
+          condition:
+            "ServiceName IN ('api') AND Timestamp NOT IN (parseDateTime64BestEffort('2026-06-16', 9))",
+        },
+      ]);
+
+      expect(parsed.filters).toEqual({
+        ServiceName: {
+          included: new Set(['api']),
+          excluded: new Set(),
+        },
+        Timestamp: {
+          included: new Set(),
+          excluded: new Set(['2026-06-16']),
+        },
+      });
+    });
+
+    it('round-trips a DateTime value containing the wrapper suffix', () => {
+      const originalFilters = {
+        Timestamp: {
+          included: new Set<string | boolean>(["a', 9)b"]),
+          excluded: new Set<string | boolean>(),
+        },
+      };
+
+      const query = filtersToQuery(originalFilters, { dateTimeColumns });
+      const parsed = parseQuery(query);
+
+      expect(parsed.filters).toEqual({
+        Timestamp: {
+          included: new Set(["a', 9)b"]),
+          excluded: new Set(),
+        },
+      });
+    });
+
+    it('round-trips a plain DateTime column (parseDateTimeBestEffort wrapper)', () => {
+      const originalFilters = {
+        TimestampTime: {
+          included: new Set<string | boolean>(['2026-06-17T11:56:41Z']),
+          excluded: new Set<string | boolean>(),
+        },
+      };
+
+      const query = filtersToQuery(originalFilters, { dateTimeColumns });
+      // Sanity: produces the DateTime (non-64) wrapper.
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
+      expect((query[0] as ConditionFilter).condition).toBe(
+        "TimestampTime IN (parseDateTimeBestEffort('2026-06-17T11:56:41Z'))",
+      );
+
+      expect(parseQuery(query).filters).toEqual({
+        TimestampTime: {
+          included: new Set(['2026-06-17T11:56:41Z']),
+          excluded: new Set(),
+        },
+      });
+    });
+
+    it('parseQuery unwraps parseDateTimeBestEffort and toDate wrappers', () => {
+      const parsed = parseQuery([
+        {
+          type: 'sql',
+          condition: "TimestampTime IN (parseDateTimeBestEffort('a'))",
+        },
+        { type: 'sql', condition: "day NOT IN (toDate('2026-06-17'))" },
+      ]);
+
+      expect(parsed.filters).toEqual({
+        TimestampTime: { included: new Set(['a']), excluded: new Set() },
+        day: { included: new Set(), excluded: new Set(['2026-06-17']) },
+      });
+    });
+
+    // The map key can be a query-result column name that isn't a table column:
+    // an alias (`TimestampTime AS time`) or a computed expression
+    // (`toDate(TimestampTime)`). These only become filterable correctly when the
+    // type map is sourced from the result set rather than the table schema.
+    it('wraps and round-trips an aliased DateTime column', () => {
+      const aliasColumns = new Map<string, string>([['time', 'DateTime64(9)']]);
+      const originalFilters = {
+        time: {
+          included: new Set<string | boolean>(['2026-06-18T10:33:55Z']),
+          excluded: new Set<string | boolean>(),
+        },
+      };
+
+      const query = filtersToQuery(originalFilters, {
+        dateTimeColumns: aliasColumns,
+      });
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
+      expect((query[0] as ConditionFilter).condition).toBe(
+        "time IN (parseDateTime64BestEffort('2026-06-18T10:33:55Z', 9))",
+      );
+
+      expect(parseQuery(query).filters).toEqual({
+        time: {
+          included: new Set(['2026-06-18T10:33:55Z']),
+          excluded: new Set(),
+        },
+      });
+    });
+
+    it('wraps a computed DateTime expression with the type-matched function', () => {
+      const exprColumns = new Map<string, string>([
+        ['toDate(TimestampTime)', 'Date'],
+      ]);
+      const originalFilters = {
+        'toDate(TimestampTime)': {
+          included: new Set<string | boolean>(['2026-06-18']),
+          excluded: new Set<string | boolean>(),
+        },
+      };
+
+      const query = filtersToQuery(originalFilters, {
+        dateTimeColumns: exprColumns,
+      });
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
+      expect((query[0] as ConditionFilter).condition).toBe(
+        "toDate(TimestampTime) IN (toDate('2026-06-18'))",
+      );
+    });
+  });
+
   describe('useSearchPageFilterState', () => {
     const onFilterChange = jest.fn();
 
@@ -638,6 +972,7 @@ describe('searchFilters', () => {
         useSearchPageFilterState({
           searchQuery: [],
           onFilterChange,
+          knownColumns: new Set(),
         }),
       );
 
@@ -658,6 +993,50 @@ describe('searchFilters', () => {
       ]);
     });
 
+    it('setOnlyFilters applies all filters in a single onFilterChange emit', () => {
+      onFilterChange.mockClear();
+      const { result } = renderHook(() =>
+        useSearchPageFilterState({
+          searchQuery: [],
+          onFilterChange,
+          knownColumns: new Set(),
+        }),
+      );
+
+      act(() => {
+        result.current.setOnlyFilters([
+          { property: 'service', value: 'app' },
+          { property: 'level', value: 'error' },
+        ]);
+      });
+
+      // Batched: a single re-query, not one per property.
+      expect(onFilterChange).toHaveBeenCalledTimes(1);
+      expect(onFilterChange).toHaveBeenLastCalledWith([
+        { type: 'sql', condition: "service IN ('app')" },
+        { type: 'sql', condition: "level IN ('error')" },
+      ]);
+    });
+
+    it('setOnlyFilters replaces any existing values for the given property', () => {
+      onFilterChange.mockClear();
+      const { result } = renderHook(() =>
+        useSearchPageFilterState({
+          searchQuery: [{ type: 'sql', condition: `level IN ('info', 'ok')` }],
+          onFilterChange,
+          knownColumns: new Set(),
+        }),
+      );
+
+      act(() => {
+        result.current.setOnlyFilters([{ property: 'level', value: 'error' }]);
+      });
+
+      expect(onFilterChange).toHaveBeenLastCalledWith([
+        { type: 'sql', condition: "level IN ('error')" },
+      ]);
+    });
+
     it('updating filter query', () => {
       const { result } = renderHook(() =>
         useSearchPageFilterState({
@@ -667,6 +1046,7 @@ describe('searchFilters', () => {
             { type: 'sql', condition: `level IN ('info', 'ok')` },
           ],
           onFilterChange,
+          knownColumns: new Set(),
         }),
       );
 
@@ -691,6 +1071,7 @@ describe('searchFilters', () => {
             { type: 'sql', condition: `level IN ('info', 'ok')` },
           ],
           onFilterChange,
+          knownColumns: new Set(),
         }),
       );
 
@@ -713,6 +1094,7 @@ describe('searchFilters', () => {
             { type: 'sql', condition: `level IN ('info', 'ok')` },
           ],
           onFilterChange,
+          knownColumns: new Set(),
         }),
       );
 
@@ -737,6 +1119,7 @@ describe('searchFilters', () => {
             { type: 'sql', condition: `level NOT IN ('error')` },
           ],
           onFilterChange,
+          knownColumns: new Set(),
         }),
       );
 
@@ -757,6 +1140,7 @@ describe('searchFilters', () => {
           useSearchPageFilterState({
             searchQuery: [],
             onFilterChange: onFilterChangeLocal,
+            knownColumns: new Set(),
           }),
         );
 
@@ -780,6 +1164,7 @@ describe('searchFilters', () => {
               { type: 'lucene', condition: 'SeverityText:"error"' },
             ],
             onFilterChange: onFilterChangeLocal,
+            knownColumns: new Set(),
           }),
         );
 
@@ -806,6 +1191,7 @@ describe('searchFilters', () => {
               },
             ],
             onFilterChange: onFilterChangeLocal,
+            knownColumns: new Set(),
           }),
         );
 
@@ -829,6 +1215,7 @@ describe('searchFilters', () => {
               { type: 'sql', condition: `AnotherGone IN ('y')` },
             ],
             onFilterChange: onFilterChangeLocal,
+            knownColumns: new Set(),
           }),
         );
 
@@ -852,6 +1239,7 @@ describe('searchFilters', () => {
               { type: 'sql', condition: `Body IN ('oops')` },
             ],
             onFilterChange: onFilterChangeLocal,
+            knownColumns: new Set(),
           }),
         );
 

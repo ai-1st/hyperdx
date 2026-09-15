@@ -4,9 +4,14 @@ import { v4 as uuidv4 } from 'uuid';
 
 import * as config from '@/config';
 import type { ObjectId } from '@/models';
+import Alert from '@/models/alert';
 import Dashboard from '@/models/dashboard';
 import { SavedSearch } from '@/models/savedSearch';
 import Team, { type ITeam, type TeamDocument } from '@/models/team';
+
+export function getTeamInviteUrl(token: string) {
+  return `${config.FRONTEND_URL}/join-team?token=${token}`;
+}
 
 const LOCAL_APP_TEAM_ID = '_local_team_';
 export const LOCAL_APP_TEAM = {
@@ -17,6 +22,7 @@ export const LOCAL_APP_TEAM = {
   hookId: uuidv4(),
   apiKey: uuidv4(),
   collectorAuthenticationEnforced: false,
+  isMetricsSeriesTableEnabled: false,
   toJSON() {
     return this;
   },
@@ -125,23 +131,17 @@ export function updateTeamClickhouseSettings(
 }
 
 export async function getTags(teamId: ObjectId) {
-  const [dashboardTags, savedSearchTags] = await Promise.all([
-    Dashboard.aggregate([
-      { $match: { team: teamId } },
-      { $unwind: '$tags' },
-      { $group: { _id: '$tags' } },
-    ]),
-    SavedSearch.aggregate([
-      { $match: { team: teamId } },
-      { $unwind: '$tags' },
-      { $group: { _id: '$tags' } },
-    ]),
+  const distinctTagsPipeline: mongoose.PipelineStage[] = [
+    { $match: { team: teamId } },
+    { $unwind: '$tags' },
+    { $group: { _id: '$tags' } },
+  ];
+
+  const tagGroups = await Promise.all([
+    Dashboard.aggregate<{ _id: string }>(distinctTagsPipeline),
+    SavedSearch.aggregate<{ _id: string }>(distinctTagsPipeline),
+    Alert.aggregate<{ _id: string }>(distinctTagsPipeline),
   ]);
 
-  return [
-    ...new Set([
-      ...dashboardTags.map(t => t._id),
-      ...savedSearchTags.map(t => t._id),
-    ]),
-  ];
+  return [...new Set(tagGroups.flat().map(t => t._id))];
 }
