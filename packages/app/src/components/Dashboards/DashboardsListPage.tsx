@@ -44,11 +44,10 @@ import {
   useDeleteDashboard,
 } from '@/dashboard';
 import { useFavorites } from '@/favorites';
+import { withAppNav } from '@/layout';
 import { useBrandDisplayName } from '@/theme/ThemeProvider';
 import { useConfirm } from '@/useConfirm';
 import { groupByTags } from '@/utils/groupByTags';
-
-import { withAppNav } from '../../layout';
 
 function getDashboardAlerts(tiles: Dashboard['tiles']) {
   return tiles.map(t => t.config.alert).filter(a => a != null);
@@ -74,6 +73,11 @@ const PRESET_DASHBOARDS = [
         },
       ]
     : []),
+  {
+    name: 'LLM',
+    href: '/llm',
+    description: 'LLM calls, token usage, cost, and latency by model',
+  },
 ];
 
 export default function DashboardsListPage() {
@@ -154,7 +158,7 @@ export default function DashboardsListPage() {
     async (id: string) => {
       const confirmed = await confirm(
         'Are you sure you want to delete this dashboard? This action cannot be undone.',
-        'Delete',
+        'Delete Dashboard',
         { variant: 'danger' },
       );
       if (!confirmed) return;
@@ -195,7 +199,7 @@ export default function DashboardsListPage() {
         <Text fw={500} size="sm" c="dimmed" mb="sm">
           Preset Dashboards
         </Text>
-        <SimpleGrid cols={{ base: 1, sm: 2, md: 3 }} mb="sm">
+        <SimpleGrid cols={{ base: 1, sm: 2, md: 3, lg: 4 }} mb="sm">
           {PRESET_DASHBOARDS.map(p => (
             <ListingCard key={p.href} {...p} />
           ))}

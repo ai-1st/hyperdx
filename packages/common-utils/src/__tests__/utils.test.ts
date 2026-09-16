@@ -1,26 +1,19 @@
 import { z } from 'zod';
 
-import { isBuilderSavedChartConfig } from '@/guards';
-import {
-  BuilderChartConfigWithDateRange,
-  Connection,
-  DashboardSchema,
-  DashboardTemplateSchema,
-  MetricsDataType,
-  SourceKind,
-  TSource,
-} from '@/types';
-
 import {
   aliasMapToWithClauses,
+  convertToCategoricalChartConfig,
   convertToDashboardDocument,
   convertToDashboardTemplate,
+  convertToNumberChartConfig,
   extractSettingsClauseFromEnd,
   findJsonExpressions,
   formatDate,
   getAlignedDateRange,
   getDistributedTableArgs,
   getFirstOrderingItem,
+  hasNonEmptyOrderBy,
+  hasPositiveSeriesLimit,
   isFirstOrderByAscending,
   isJsonExpression,
   isTimestampExpressionInFirstOrderBy,
@@ -33,7 +26,17 @@ import {
   replaceJsonExpressions,
   splitAndTrimCSV,
   splitAndTrimWithBracket,
-} from '../core/utils';
+} from '@/core/utils';
+import { isBuilderSavedChartConfig } from '@/guards';
+import {
+  BuilderChartConfigWithDateRange,
+  Connection,
+  DashboardSchema,
+  DashboardTemplateSchema,
+  MetricsDataType,
+  SourceKind,
+  TSource,
+} from '@/types';
 
 describe('utils', () => {
   // Suppress expected console.error noise from invalid text index types,
@@ -205,6 +208,30 @@ describe('utils', () => {
       expect(splitAndTrimWithBracket(input)).toEqual(expected);
     });
 
+    it('should keep commas inside single-quoted strings with backslash-escaped quotes', () => {
+      const input = "'it\\'s,ok' AS label, count()";
+      const expected = ["'it\\'s,ok' AS label", 'count()'];
+      expect(splitAndTrimWithBracket(input)).toEqual(expected);
+    });
+
+    it('should keep commas inside double-quoted identifiers with escaped quotes', () => {
+      const input = '"foo\\"bar,baz" AS label, count()';
+      const expected = ['"foo\\"bar,baz" AS label', 'count()'];
+      expect(splitAndTrimWithBracket(input)).toEqual(expected);
+    });
+
+    it('should keep commas inside single-quoted strings with doubled quotes', () => {
+      const input = "'it''s,ok' AS label, count()";
+      const expected = ["'it''s,ok' AS label", 'count()'];
+      expect(splitAndTrimWithBracket(input)).toEqual(expected);
+    });
+
+    it('should close strings after an even number of backslashes', () => {
+      const input = "'path\\\\', count()";
+      const expected = ["'path\\\\'", 'count()'];
+      expect(splitAndTrimWithBracket(input)).toEqual(expected);
+    });
+
     it('should handle mixed quotes with commas', () => {
       const input = `col1, "double, quoted", col2, 'single, quoted', col3`;
       const expected = [
@@ -262,6 +289,313 @@ describe('utils', () => {
         'ServiceName DESC',
       ];
       expect(splitAndTrimWithBracket(input)).toEqual(expected);
+    });
+  });
+
+  describe('hasPositiveSeriesLimit', () => {
+    it('is true only for positive integers', () => {
+      expect(hasPositiveSeriesLimit(1)).toBe(true);
+      expect(hasPositiveSeriesLimit(250)).toBe(true);
+    });
+
+    it('is false for 0 (unlimited) and null/undefined (unset)', () => {
+      expect(hasPositiveSeriesLimit(0)).toBe(false);
+      expect(hasPositiveSeriesLimit(null)).toBe(false);
+      expect(hasPositiveSeriesLimit(undefined)).toBe(false);
+    });
+
+    it('is false for negative values', () => {
+      expect(hasPositiveSeriesLimit(-5)).toBe(false);
+    });
+  });
+
+  describe('convertToCategoricalChartConfig', () => {
+    const dateRange: [Date, Date] = [
+      new Date('2025-11-26T00:00:00Z'),
+      new Date('2025-11-27T00:00:00Z'),
+    ];
+
+    it('should remove granularity but keep groupBy', () => {
+      const config = {
+        granularity: '5 minute',
+        groupBy: 'ServiceName',
+        dateRange,
+      } as BuilderChartConfigWithDateRange;
+
+      const convertedConfig = convertToCategoricalChartConfig(config);
+
+      expect(convertedConfig.granularity).toBeUndefined();
+      expect(convertedConfig.groupBy).toEqual('ServiceName');
+    });
+
+    it('should not inject a limit or orderBy when no seriesLimit is set', () => {
+      const config = {
+        select: [{ aggFn: 'count', valueExpression: '' }],
+        groupBy: 'ServiceName',
+        dateRange,
+      } as BuilderChartConfigWithDateRange;
+
+      const convertedConfig = convertToCategoricalChartConfig(config);
+
+      expect(convertedConfig.orderBy).toBeUndefined();
+      expect(convertedConfig.limit).toBeUndefined();
+    });
+
+    it('should apply seriesLimit as a limit ordered by the first value descending', () => {
+      const config = {
+        select: [{ aggFn: 'count', valueExpression: '' }],
+        groupBy: 'ServiceName',
+        seriesLimit: 5,
+        dateRange,
+      } as BuilderChartConfigWithDateRange;
+
+      const convertedConfig = convertToCategoricalChartConfig(config);
+
+      expect(convertedConfig.select[0]).toMatchObject({ alias: 'Value' });
+      expect(convertedConfig.orderBy).toEqual([
+        { valueExpression: '"Value"', ordering: 'DESC' },
+        { valueExpression: 'ServiceName', ordering: 'ASC' },
+      ]);
+      expect(convertedConfig.limit).toEqual({ limit: 5 });
+    });
+
+    it('should order by the existing alias when the first series has one', () => {
+      const config = {
+        select: [
+          { aggFn: 'count', valueExpression: '', alias: 'Request "Count"' },
+        ],
+        groupBy: 'ServiceName',
+        seriesLimit: 3,
+        dateRange,
+      } as BuilderChartConfigWithDateRange;
+
+      const convertedConfig = convertToCategoricalChartConfig(config);
+
+      expect(convertedConfig.select[0]).toMatchObject({
+        alias: 'Request "Count"',
+      });
+      expect(convertedConfig.orderBy).toEqual([
+        { valueExpression: '"Request ""Count"""', ordering: 'DESC' },
+        { valueExpression: 'ServiceName', ordering: 'ASC' },
+      ]);
+      expect(convertedConfig.limit).toEqual({ limit: 3 });
+    });
+
+    it('should preserve a user-supplied string orderBy over the value-descending default when a limit is set', () => {
+      const config = {
+        select: [{ aggFn: 'count', valueExpression: '' }],
+        groupBy: 'ServiceName',
+        seriesLimit: 5,
+        orderBy: 'ServiceName ASC',
+        dateRange,
+      } as BuilderChartConfigWithDateRange;
+
+      const convertedConfig = convertToCategoricalChartConfig(config);
+
+      // The user's explicit ORDER BY wins; the limit then keeps the top rows
+      // according to that ordering rather than the value-descending default.
+      expect(convertedConfig.orderBy).toEqual('ServiceName ASC');
+      expect(convertedConfig.limit).toEqual({ limit: 5 });
+      // The default value alias is only injected when we synthesize an
+      // ordering, so an untouched series keeps no alias.
+      expect(convertedConfig.select[0]).not.toHaveProperty('alias');
+    });
+
+    it('should preserve a user-supplied array orderBy over the value-descending default when a limit is set', () => {
+      const config = {
+        select: [{ aggFn: 'count', valueExpression: '' }],
+        groupBy: 'ServiceName',
+        seriesLimit: 5,
+        orderBy: [
+          { valueExpression: 'ServiceName', ordering: 'DESC' as const },
+        ],
+        dateRange,
+      } as BuilderChartConfigWithDateRange;
+
+      const convertedConfig = convertToCategoricalChartConfig(config);
+
+      expect(convertedConfig.orderBy).toEqual([
+        { valueExpression: 'ServiceName', ordering: 'DESC' },
+      ]);
+      expect(convertedConfig.limit).toEqual({ limit: 5 });
+    });
+
+    it('should preserve a user-supplied orderBy even when no limit is set', () => {
+      const config = {
+        select: [{ aggFn: 'count', valueExpression: '' }],
+        groupBy: 'ServiceName',
+        orderBy: 'ServiceName ASC',
+        dateRange,
+      } as BuilderChartConfigWithDateRange;
+
+      const convertedConfig = convertToCategoricalChartConfig(config);
+
+      expect(convertedConfig.orderBy).toEqual('ServiceName ASC');
+      expect(convertedConfig.limit).toBeUndefined();
+    });
+
+    it('should inject the value-descending default when the user orderBy is an empty string', () => {
+      const config = {
+        select: [{ aggFn: 'count', valueExpression: '' }],
+        groupBy: 'ServiceName',
+        seriesLimit: 5,
+        orderBy: '',
+        dateRange,
+      } as BuilderChartConfigWithDateRange;
+
+      const convertedConfig = convertToCategoricalChartConfig(config);
+
+      expect(convertedConfig.orderBy).toEqual([
+        { valueExpression: '"Value"', ordering: 'DESC' },
+        { valueExpression: 'ServiceName', ordering: 'ASC' },
+      ]);
+      expect(convertedConfig.limit).toEqual({ limit: 5 });
+    });
+
+    it('should inject the value-descending ordering for ratio configs too', () => {
+      const config = {
+        select: [{ aggFn: 'count', valueExpression: '' }],
+        groupBy: 'ServiceName',
+        seriesLimit: 5,
+        seriesReturnType: 'ratio',
+        dateRange,
+      } as BuilderChartConfigWithDateRange;
+
+      const convertedConfig = convertToCategoricalChartConfig(config);
+
+      expect(convertedConfig.orderBy).toEqual([
+        { valueExpression: '"Value"', ordering: 'DESC' },
+        { valueExpression: 'ServiceName', ordering: 'ASC' },
+      ]);
+      expect(convertedConfig.limit).toEqual({ limit: 5 });
+    });
+
+    it('should preserve an explicit limit over seriesLimit', () => {
+      const config = {
+        select: [{ aggFn: 'count', valueExpression: '' }],
+        groupBy: 'ServiceName',
+        seriesLimit: 5,
+        limit: { limit: 2 },
+        dateRange,
+      } as BuilderChartConfigWithDateRange;
+
+      const convertedConfig = convertToCategoricalChartConfig(config);
+
+      expect(convertedConfig.limit).toEqual({ limit: 2 });
+    });
+
+    it('should not inject an orderBy when there is no groupBy', () => {
+      const config = {
+        select: [{ aggFn: 'count', valueExpression: '' }],
+        seriesLimit: 5,
+        dateRange,
+      } as BuilderChartConfigWithDateRange;
+
+      const convertedConfig = convertToCategoricalChartConfig(config);
+
+      expect(convertedConfig.orderBy).toBeUndefined();
+    });
+
+    it('should not mutate the input config', () => {
+      const config = {
+        select: [{ aggFn: 'count', valueExpression: '' }],
+        groupBy: 'ServiceName',
+        seriesLimit: 5,
+        dateRange,
+      } as BuilderChartConfigWithDateRange;
+
+      convertToCategoricalChartConfig(config);
+
+      expect(config.select[0]).not.toHaveProperty('alias');
+      expect(config.orderBy).toBeUndefined();
+      expect(config.limit).toBeUndefined();
+    });
+  });
+
+  describe('convertToNumberChartConfig', () => {
+    const dateRange: [Date, Date] = [
+      new Date('2025-11-26T00:00:00Z'),
+      new Date('2025-11-27T00:00:00Z'),
+    ];
+
+    it('drops granularity and groupBy', () => {
+      const config = {
+        select: [{ aggFn: 'count', valueExpression: '' }],
+        granularity: '5 minute',
+        groupBy: 'ServiceName',
+        dateRange,
+      } as BuilderChartConfigWithDateRange;
+
+      const converted = convertToNumberChartConfig(config);
+
+      expect(converted.granularity).toBeUndefined();
+      expect(converted.groupBy).toBeUndefined();
+    });
+
+    it('leaves showOperandSeries untouched without formulas', () => {
+      const config = {
+        select: [{ aggFn: 'count', valueExpression: '' }],
+        dateRange,
+      } as BuilderChartConfigWithDateRange;
+
+      expect(convertToNumberChartConfig(config).showOperandSeries).toBe(
+        undefined,
+      );
+    });
+
+    it('always hides operand series for formula configs (HDX-5080)', () => {
+      // A number chart displays the first value column of the result, so the
+      // formula column must be the only projection — even when the stored
+      // config shows operand series on other display types.
+      const config = {
+        select: [
+          { aggFn: 'max', valueExpression: 'Value' },
+          { aggFn: 'max', valueExpression: 'Value' },
+        ],
+        formulas: [{ expression: 'A / B * 100' }],
+        granularity: '5 minute',
+        dateRange,
+      } as BuilderChartConfigWithDateRange;
+
+      expect(convertToNumberChartConfig(config).showOperandSeries).toBe(false);
+      expect(
+        convertToNumberChartConfig({ ...config, showOperandSeries: true })
+          .showOperandSeries,
+      ).toBe(false);
+    });
+  });
+
+  describe('hasCategoricalUserOrderBy', () => {
+    it('returns false for undefined', () => {
+      expect(hasNonEmptyOrderBy(undefined)).toBe(false);
+    });
+
+    it('returns false for null', () => {
+      expect(hasNonEmptyOrderBy(null)).toBe(false);
+    });
+
+    it('returns false for an empty string', () => {
+      expect(hasNonEmptyOrderBy('')).toBe(false);
+    });
+
+    it('returns false for a whitespace-only string', () => {
+      expect(hasNonEmptyOrderBy('   ')).toBe(false);
+    });
+
+    it('returns true for a non-empty string', () => {
+      expect(hasNonEmptyOrderBy('ServiceName ASC')).toBe(true);
+    });
+
+    it('returns false for an empty array', () => {
+      expect(hasNonEmptyOrderBy([])).toBe(false);
+    });
+
+    it('returns true for a non-empty array of sort specifications', () => {
+      expect(
+        hasNonEmptyOrderBy([
+          { valueExpression: 'ServiceName', ordering: 'DESC' },
+        ]),
+      ).toBe(true);
     });
   });
 
@@ -933,8 +1267,185 @@ describe('utils', () => {
           source: 'Logs',
         },
       ]);
-      expect(template.filters?.[2].appliesToSourceIds).toBeUndefined();
-      expect(template.filters?.[3].appliesToSourceIds).toBeUndefined();
+      // Explicitly absent rather than an empty array, which the import would
+      // read as "matches no tiles". Both are queried filters, pinned above.
+      for (const index of [2, 3]) {
+        const filter = template.filters![index];
+        expect(filter.type).toBe('QUERY_EXPRESSION');
+        expect(
+          filter.type === 'QUERY_EXPRESSION' && filter.appliesToSourceIds,
+        ).toBeUndefined();
+      }
+    });
+
+    // Variable settings are dashboard-local — unlike `source` and
+    // `appliesToSourceIds` they reference nothing in the workspace, so they need
+    // no name↔ID remapping and must survive export verbatim.
+    it('should export filter variable settings unchanged while still remapping sources', () => {
+      const sources: TSource[] = [
+        {
+          id: 'source1',
+          name: 'Logs',
+          connection: 'connection1',
+          kind: SourceKind.Log,
+          from: { databaseName: 'db1', tableName: 'logs_table' },
+          timestampValueExpression: 'Timestamp',
+          defaultTableSelectExpression: '',
+        },
+      ];
+
+      const dashboard: z.infer<typeof DashboardSchema> = {
+        id: 'dashboard1',
+        name: 'Variables Dashboard',
+        tags: [],
+        tiles: [],
+        filters: [
+          {
+            id: 'filter-variable',
+            type: 'QUERY_EXPRESSION',
+            name: 'Service Name',
+            expression: 'ServiceName',
+            source: 'source1',
+            appliesToSourceIds: ['source1'],
+            isBroadcastEnabled: false,
+            isVariableEnabled: true,
+            variableName: 'Service_Name',
+          },
+        ],
+      };
+
+      const template = convertToDashboardTemplate(dashboard, sources);
+
+      expect(template.filters).toEqual([
+        {
+          id: 'filter-variable',
+          type: 'QUERY_EXPRESSION',
+          name: 'Service Name',
+          expression: 'ServiceName',
+          source: 'Logs',
+          appliesToSourceIds: ['Logs'],
+          isBroadcastEnabled: false,
+          isVariableEnabled: true,
+          variableName: 'Service_Name',
+        },
+      ]);
+    });
+
+    it('should export a promql-label filter with its source id remapped to a name', () => {
+      const sources: TSource[] = [
+        {
+          id: 'source1',
+          name: 'Prom',
+          connection: 'connection1',
+          kind: SourceKind.Promql,
+          from: { databaseName: 'db1', tableName: 'timeseries_table' },
+          timestampValueExpression: 'Timestamp',
+        },
+      ];
+
+      const dashboard: z.infer<typeof DashboardSchema> = {
+        id: 'dashboard1',
+        name: 'PromQL Filter Dashboard',
+        tags: [],
+        tiles: [],
+        filters: [
+          {
+            id: 'filter-promql',
+            type: 'PROMETHEUS_LABEL',
+            name: 'Pod',
+            source: 'source1',
+            label: 'pod',
+            isBroadcastEnabled: false,
+            isVariableEnabled: true,
+            variableName: 'pod',
+          },
+        ],
+      };
+
+      const template = convertToDashboardTemplate(dashboard, sources);
+
+      expect(template.filters).toEqual([
+        {
+          id: 'filter-promql',
+          type: 'PROMETHEUS_LABEL',
+          name: 'Pod',
+          source: 'Prom',
+          label: 'pod',
+          isBroadcastEnabled: false,
+          isVariableEnabled: true,
+          variableName: 'pod',
+        },
+      ]);
+      // Only queried filters broadcast, so no applies-to key is stamped on.
+      expect('appliesToSourceIds' in template.filters![0]).toBe(false);
+    });
+
+    // A `STATIC_LIST` filter references nothing in the workspace at all, so it
+    // must survive export untouched — in particular `source` must stay absent
+    // rather than being stamped with the empty string the name lookup returns
+    // for an unresolvable id, which the re-import would then reject.
+    it('should export a static-list filter with no source', () => {
+      const sources: TSource[] = [
+        {
+          id: 'source1',
+          name: 'Logs',
+          connection: 'connection1',
+          kind: SourceKind.Log,
+          from: { databaseName: 'db1', tableName: 'logs_table' },
+          timestampValueExpression: 'Timestamp',
+          defaultTableSelectExpression: '',
+        },
+      ];
+
+      const staticFilter = {
+        id: 'filter-static',
+        type: 'STATIC_LIST' as const,
+        name: 'Environment',
+        options: ['prod', 'staging', 'dev'],
+        isBroadcastEnabled: false as const,
+        isVariableEnabled: true as const,
+        variableName: 'env',
+      };
+
+      const dashboard: z.infer<typeof DashboardSchema> = {
+        id: 'dashboard1',
+        name: 'Static Filter Dashboard',
+        tags: [],
+        tiles: [],
+        filters: [
+          staticFilter,
+          {
+            id: 'filter-queried',
+            type: 'QUERY_EXPRESSION',
+            name: 'Service',
+            expression: 'ServiceName',
+            source: 'source1',
+          },
+        ],
+      };
+
+      const template = convertToDashboardTemplate(dashboard, sources);
+
+      expect(template.filters).toEqual([
+        staticFilter,
+        {
+          id: 'filter-queried',
+          type: 'QUERY_EXPRESSION',
+          name: 'Service',
+          expression: 'ServiceName',
+          source: 'Logs',
+        },
+      ]);
+      // No `source` key at all, rather than one holding the empty string the
+      // name lookup returns for an unresolvable id.
+      expect('source' in template.filters![0]).toBe(false);
+
+      // And back: the import path carries the filter through verbatim, so a
+      // round-trip through the template format is lossless.
+      expect(
+        convertToDashboardDocument({ ...template, filters: template.filters })
+          .filters?.[0],
+      ).toEqual(staticFilter);
     });
 
     it('should convert a dashboard without filters to a dashboard template', () => {
@@ -1357,6 +1868,23 @@ describe('utils', () => {
             type: 'search',
             target: { mode: 'template', template: '{{Src}}' },
             whereLanguage: 'sql',
+          },
+        });
+      });
+
+      it('leaves an external onClick untouched (no source mapping)', () => {
+        const dashboard = makeDashboard({
+          type: 'external',
+          urlTemplate: 'https://grafana.example.com/d/abc?svc={{ServiceName}}',
+        });
+
+        const template = convertToDashboardTemplate(dashboard, [source]);
+
+        expect(template.tiles[0].config).toMatchObject({
+          onClick: {
+            type: 'external',
+            urlTemplate:
+              'https://grafana.example.com/d/abc?svc={{ServiceName}}',
           },
         });
       });
@@ -2709,6 +3237,34 @@ describe('utils', () => {
       const metadata = makeMetadata({
         EventDate: 'Date',
         EventTime: 'Nullable(DateTime)',
+      });
+      expect(
+        await pickBucketTimestampColumn({
+          timestampValueExpression: 'EventDate, EventTime',
+          metadata,
+          ...opts,
+        }),
+      ).toBe('EventTime');
+    });
+
+    it('DateTime with an explicit timezone still classifies as DateTime', async () => {
+      const metadata = makeMetadata({
+        EventDate: 'Date',
+        EventTime: "DateTime('UTC')",
+      });
+      expect(
+        await pickBucketTimestampColumn({
+          timestampValueExpression: 'EventDate, EventTime',
+          metadata,
+          ...opts,
+        }),
+      ).toBe('EventTime');
+    });
+
+    it('Nullable(DateTime) with an explicit timezone still classifies as DateTime', async () => {
+      const metadata = makeMetadata({
+        EventDate: 'Date',
+        EventTime: "Nullable(DateTime('Europe/Berlin'))",
       });
       expect(
         await pickBucketTimestampColumn({

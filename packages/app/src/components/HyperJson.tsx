@@ -34,18 +34,25 @@ export type GetLineActions = (arg0: {
   parsedJsonRootPath?: string[];
 }) => LineAction[];
 
+export type FormatLeafValue = (arg0: {
+  keyName: string;
+  keyPath: string[];
+  value: unknown;
+}) => React.ReactNode | undefined;
+
 // Store common state in an atom so that it can be shared between components
 // to avoid prop drilling
 type HyperJsonAtom = {
   normallyExpanded: boolean;
   getLineActions?: GetLineActions;
+  formatLeafValue?: FormatLeafValue;
 };
 const hyperJsonAtom = atom<HyperJsonAtom>({
   normallyExpanded: false,
 });
 
 const ValueRenderer = React.memo(
-  React.forwardRef<HTMLSpanElement, { value: any }>(({ value }, ref) => {
+  ({ value, ref }: { value: any; ref?: React.Ref<HTMLSpanElement> }) => {
     if (isNull(value)) {
       return (
         <span ref={ref} className={styles.null}>
@@ -89,7 +96,7 @@ const ValueRenderer = React.memo(
       );
     }
     return null;
-  }),
+  },
 );
 
 const LineMenu = React.memo(
@@ -217,11 +224,20 @@ const Line = React.memo(
       return value;
     }, [isStringValueValidJson, value]);
 
+    const { formatLeafValue } = useAtomValue(hyperJsonAtom);
+
     const nestedLevel = parentKeyPath.length;
     const keyPath = React.useMemo(
       () => [...parentKeyPath, keyName],
       [keyName, parentKeyPath],
     );
+
+    const formattedLeafValue = React.useMemo(() => {
+      if (formatLeafValue == null) {
+        return undefined;
+      }
+      return formatLeafValue({ keyName, keyPath, value });
+    }, [formatLeafValue, keyName, keyPath, value]);
 
     // Determine the context for nested parsed JSON
     const childIsInParsedJson = isInParsedJson || isStringValueValidJson;
@@ -256,6 +272,7 @@ const Line = React.memo(
       <>
         <div
           ref={ref}
+          data-testid="json-viewer-line"
           onClick={handleToggle}
           className={cx(styles.line, {
             [styles.nestedLine]: nestedLevel > 0,
@@ -289,6 +306,10 @@ const Line = React.memo(
                   <div className={styles.jsonBtn}>Expand JSON</div>
                 </>
               )
+            ) : formattedLeafValue !== undefined ? (
+              <span ref={valueRef} className={styles.string}>
+                {formattedLeafValue}
+              </span>
             ) : (
               <ValueRenderer value={value} ref={valueRef} />
             )}
@@ -336,11 +357,26 @@ function TreeNode({
   const keyPath = React.useMemo(() => _keyPath ?? [], [_keyPath]);
 
   const originalLength = React.useMemo(() => Object.keys(data).length, [data]);
+
+  // ClickHouse hands back `Map(...)` keys in physical storage order, which reads
+  // as random for wide maps like `ProfileEvents`. Sorting here (rather than
+  // upstream) covers every nesting level for free, since TreeNode recurses, and
+  // it puts the sort ahead of the MAX_TREE_NODE_ITEMS slice below so the
+  // truncated view shows a predictable prefix instead of an arbitrary subset.
+  const entries = React.useMemo(() => {
+    const raw = Object.entries(data);
+    // Arrays are index-keyed — reordering them would change the data.
+    if (isArray(data)) {
+      return raw;
+    }
+    return raw.sort(([a], [b]) =>
+      a.localeCompare(b, undefined, { numeric: true }),
+    );
+  }, [data]);
+
   const visibleLines = React.useMemo(() => {
-    return isExpanded
-      ? Object.entries(data)
-      : Object.entries(data).slice(0, MAX_TREE_NODE_ITEMS);
-  }, [data, isExpanded]);
+    return isExpanded ? entries : entries.slice(0, MAX_TREE_NODE_ITEMS);
+  }, [entries, isExpanded]);
   const nestedLevel = keyPath?.length || 0;
 
   return (
@@ -395,6 +431,7 @@ type HyperJsonProps = {
   tabulate?: boolean;
   whiteSpace?: 'pre' | 'pre-wrap';
   getLineActions?: GetLineActions;
+  formatLeafValue?: FormatLeafValue;
 };
 
 const HyperJson = ({
@@ -403,12 +440,15 @@ const HyperJson = ({
   tabulate = false,
   whiteSpace = 'pre-wrap',
   getLineActions,
+  formatLeafValue,
 }: HyperJsonProps) => {
   const isEmpty = React.useMemo(() => Object.keys(data).length === 0, [data]);
 
   return (
     <Provider>
-      <HydrateAtoms initialValues={{ normallyExpanded, getLineActions }}>
+      <HydrateAtoms
+        initialValues={{ normallyExpanded, getLineActions, formatLeafValue }}
+      >
         <div
           className={cx(styles.container, {
             [styles.withTabulate]: tabulate,

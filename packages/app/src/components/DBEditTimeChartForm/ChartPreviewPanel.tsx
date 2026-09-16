@@ -6,17 +6,19 @@ import {
   BuilderChartConfigWithOptTimestamp,
   ChartConfigWithDateRange,
   ChartConfigWithOptTimestamp,
+  DisplayType,
   SourceKind,
   TSource,
 } from '@hyperdx/common-utils/dist/types';
 import { Accordion, Divider, Stack, Text } from '@mantine/core';
-import { IconCode, IconList } from '@tabler/icons-react';
+import { IconList } from '@tabler/icons-react';
 import { SortingState } from '@tanstack/react-table';
 
 import { buildTableRowSearchUrl } from '@/ChartUtils';
 import { getAlertReferenceLines } from '@/components/Alerts';
 import { ChartEditorFormState } from '@/components/ChartEditor/types';
 import ChartSQLPreview from '@/components/ChartSQLPreview';
+import { DBBarChart } from '@/components/DBBarChart';
 import DBHeatmapChart, {
   buildHeatmapBoundsConfig,
   buildHeatmapBucketConfig,
@@ -29,13 +31,28 @@ import DBSqlRowTableWithSideBar from '@/components/DBSqlRowTableWithSidebar';
 import DBTableChart from '@/components/DBTableChart';
 import { DBTimeChart } from '@/components/DBTimeChart';
 import EmptyState from '@/components/EmptyState';
-import { getFirstTimestampValueExpression } from '@/source';
+import PatternTable from '@/components/PatternTable';
+import PromQLPreview from '@/components/PromQLEditor/PromQLPreview';
+import {
+  getEventBody,
+  getFirstTimestampValueExpression,
+  isSingleExpression,
+} from '@/source';
 import {
   orderByStringToSortingState,
   sortingStateToOrderByString,
 } from '@/utils';
 
-import { buildSampleEventsConfig, isQueryReady } from './utils';
+import { QueryPreviewAccordion } from './QueryPreviewAccordion';
+import {
+  buildRenderedPromqlExpression,
+  buildSampleEventsConfig,
+  isQueryReady,
+  tabQueriesData,
+} from './utils';
+
+/** Why a preview accordion is empty before its tile has been run. */
+const RUN_TO_PREVIEW = 'Run the query to see the preview';
 
 function HeatmapPreview({
   config,
@@ -68,12 +85,16 @@ function HeatmapSQLPreview({
   config: BuilderChartConfigWithOptTimestamp;
   dateRange: [Date, Date];
 }) {
-  if (!config.timestampValueExpression) {
+  const { timestampValueExpression } = config;
+  if (!timestampValueExpression) {
     return null;
   }
-  const { heatmapConfig, scaleType } = toHeatmapChartConfig(
-    config as BuilderChartConfigWithDateRange,
-  );
+  const configWithTimestamp: BuilderChartConfigWithDateRange = {
+    ...config,
+    timestampValueExpression,
+  };
+  const { heatmapConfig, scaleType } =
+    toHeatmapChartConfig(configWithTimestamp);
   const granularity = convertDateRangeToGranularityString(dateRange, 245);
 
   const boundsConfig = buildHeatmapBoundsConfig({
@@ -120,7 +141,10 @@ type ChartPreviewPanelProps = {
   chartConfigForExplanations?: ChartConfigWithOptTimestamp;
   showGeneratedSql: boolean;
   showSampleEvents: boolean;
+  showGeneratedPromql: boolean;
   dbTimeChartConfig?: ChartConfigWithDateRange;
+  /** Required dashboard filters with nothing selected that block this tile. */
+  missingRequiredFilterNames?: string[];
   setValue: (name: 'orderBy', value: string) => void;
   onSubmit: () => void;
 };
@@ -136,13 +160,24 @@ export function ChartPreviewPanel({
   chartConfigForExplanations,
   showGeneratedSql,
   showSampleEvents,
+  showGeneratedPromql,
   dbTimeChartConfig,
+  missingRequiredFilterNames,
   setValue,
   onSubmit,
 }: ChartPreviewPanelProps) {
   const [isSampleEventsOpen, setIsSampleEventsOpen] = useState(false);
 
-  const queryReady = !!isQueryReady(queriedConfig);
+  const renderedPromql = useMemo(
+    () => buildRenderedPromqlExpression(queriedConfig),
+    [queriedConfig],
+  );
+
+  const blockingFilterNames = missingRequiredFilterNames ?? [];
+  const isBlockedByRequiredFilters =
+    blockingFilterNames.length > 0 && tabQueriesData(activeTab);
+  const queryReady =
+    !isBlockedByRequiredFilters && !!isQueryReady(queriedConfig);
 
   const onTableSortingChange = useCallback(
     (sortState: SortingState | null) => {
@@ -176,7 +211,16 @@ export function ChartPreviewPanel({
 
   return (
     <>
-      {!queryReady && activeTab !== 'markdown' ? (
+      {isBlockedByRequiredFilters ? (
+        <EmptyState
+          description={`Missing required filters: ${blockingFilterNames.join(
+            ', ',
+          )}. Select a value for each required filter, or turn off “Apply filters” to preview this tile without them.`}
+          variant="card"
+          fullWidth
+          data-testid="preview-missing-required-filters"
+        />
+      ) : !queryReady && tabQueriesData(activeTab) ? (
         <EmptyState
           description="Please start by defining your chart above and then click the play button to query data."
           variant="card"
@@ -221,12 +265,25 @@ export function ChartPreviewPanel({
             }
             errorVariant="inline"
             showMVOptimizationIndicator={false}
+            // Preview doesn't need the MV indicators; disabling both lets
+            // DBTimeChart skip the extra MV-optimization EXPLAIN query, which
+            // otherwise fires on every edit-modal open / submit.
+            showDateRangeIndicator={false}
           />
         </div>
       )}
       {queryReady && queriedConfig != null && activeTab === 'pie' && (
         <div className="flex-grow-1 d-flex flex-column" style={{ height: 400 }}>
           <DBPieChart
+            config={queriedConfig}
+            showMVOptimizationIndicator={false}
+            errorVariant="inline"
+          />
+        </div>
+      )}
+      {queryReady && queriedConfig != null && activeTab === 'bar' && (
+        <div className="flex-grow-1 d-flex flex-column" style={{ height: 400 }}>
+          <DBBarChart
             config={queriedConfig}
             showMVOptimizationIndicator={false}
             errorVariant="inline"
@@ -291,6 +348,65 @@ export function ChartPreviewPanel({
             />
           </div>
         )}
+      {queryReady &&
+        tableSource &&
+        queriedConfig != null &&
+        isBuilderChartConfig(queriedConfig) &&
+        activeTab === 'event_patterns' && (
+          <div
+            className="flex-grow-1 d-flex flex-column"
+            style={{ minHeight: 400 }}
+          >
+            <PatternTable
+              source={tableSource}
+              config={{
+                ...queriedConfig,
+                // Override source-specific fields from the live source so
+                // switching sources doesn't query the stale table/connection
+                // or stale defaultTableSelectExpression columns.
+                from: tableSource.from,
+                connection: tableSource.connection,
+                timestampValueExpression: tableSource.timestampValueExpression,
+                // PatternTable's usePatterns hook overrides `select` with
+                // pattern-specific columns, so clear the stale
+                // defaultTableSelectExpression to prevent old-source columns
+                // (e.g. SeverityText from a log source) from leaking through.
+                select: '',
+                displayType: DisplayType.Table,
+                dateRange,
+                granularity: undefined,
+              }}
+              bodyValueExpression={
+                // Prefer the user's custom pattern expression (stored in
+                // queriedConfig.select) when set. Reject multi-column
+                // strings — those are stale defaultTableSelectExpression
+                // values from pre-fix saved tiles, not a single pattern
+                // expression. Uses bracket-aware splitting so expressions
+                // like COALESCE(a, b) are correctly treated as single.
+                (typeof queriedConfig.select === 'string' &&
+                queriedConfig.select.length > 0 &&
+                isSingleExpression(queriedConfig.select)
+                  ? queriedConfig.select
+                  : undefined) ??
+                getEventBody(tableSource) ??
+                ''
+              }
+              totalCountConfig={{
+                ...queriedConfig,
+                from: tableSource.from,
+                connection: tableSource.connection,
+                timestampValueExpression: tableSource.timestampValueExpression,
+                displayType: DisplayType.Table,
+                dateRange,
+                select: 'count() as total',
+                groupBy: undefined,
+                orderBy: undefined,
+                granularity: undefined,
+              }}
+              totalCountQueryKeyPrefix="chart-editor-patterns"
+            />
+          </div>
+        )}
       {showGeneratedSql && (
         <>
           <Divider mt="md" />
@@ -324,31 +440,43 @@ export function ChartPreviewPanel({
               </Accordion.Item>
             </Accordion>
           )}
-          <Accordion defaultValue="">
-            <Accordion.Item value={'SQL'}>
-              <Accordion.Control icon={<IconCode size={16} />}>
-                <Text size="sm" style={{ alignSelf: 'center' }}>
-                  Generated SQL
-                </Text>
-              </Accordion.Control>
-              <Accordion.Panel>
-                {queryReady &&
-                  chartConfigForExplanations != null &&
-                  (activeTab === 'heatmap' &&
-                  isBuilderChartConfig(chartConfigForExplanations) ? (
-                    <HeatmapSQLPreview
-                      config={chartConfigForExplanations}
-                      dateRange={dateRange}
-                    />
-                  ) : (
-                    <ChartSQLPreview
-                      config={chartConfigForExplanations}
-                      enableCopy
-                    />
-                  ))}
-              </Accordion.Panel>
-            </Accordion.Item>
-          </Accordion>
+          <QueryPreviewAccordion
+            value="SQL"
+            label="Generated SQL"
+            disabledReason={
+              queryReady && chartConfigForExplanations != null
+                ? undefined
+                : RUN_TO_PREVIEW
+            }
+          >
+            {chartConfigForExplanations != null &&
+              (activeTab === 'heatmap' &&
+              isBuilderChartConfig(chartConfigForExplanations) ? (
+                <HeatmapSQLPreview
+                  config={chartConfigForExplanations}
+                  dateRange={dateRange}
+                />
+              ) : (
+                <ChartSQLPreview
+                  config={chartConfigForExplanations}
+                  enableCopy
+                />
+              ))}
+          </QueryPreviewAccordion>
+        </>
+      )}
+      {showGeneratedPromql && (
+        <>
+          <Divider mt="md" />
+          <QueryPreviewAccordion
+            value="promql"
+            label="Generated PromQL"
+            disabledReason={
+              renderedPromql == null ? RUN_TO_PREVIEW : renderedPromql.error
+            }
+          >
+            <PromQLPreview expression={renderedPromql?.expression ?? ''} />
+          </QueryPreviewAccordion>
         </>
       )}
     </>

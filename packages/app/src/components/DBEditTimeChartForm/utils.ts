@@ -1,5 +1,13 @@
 import z from 'zod';
 import {
+  TableConnection,
+  TableConnectionChoice,
+} from '@hyperdx/common-utils/dist/core/metadata';
+import {
+  configConsumesBroadcastFilters,
+  getBlockingRequiredFilterNames,
+} from '@hyperdx/common-utils/dist/dashboardFilterValues';
+import {
   isBuilderChartConfig,
   isPromqlChartConfig,
   isRawSqlChartConfig,
@@ -10,6 +18,8 @@ import {
   ChartAlertBaseSchema,
   ChartConfigWithDateRange,
   ChartConfigWithOptTimestamp,
+  ChartVariable,
+  DashboardFilter,
   DisplayType,
   Filter,
   SavedChartConfig,
@@ -18,15 +28,21 @@ import {
   TSource,
   validateAlertScheduleOffsetMinutes,
 } from '@hyperdx/common-utils/dist/types';
+import {
+  filterReferencedVariables,
+  substitutePromqlChartConfigVariables,
+} from '@hyperdx/common-utils/dist/variables';
 
 import {
+  convertToCategoricalChartConfig,
   convertToNumberChartConfig,
-  convertToPieChartConfig,
   convertToTableChartConfig,
   convertToTimeChartConfig,
+  tryExpandConfigVariables,
 } from '@/ChartUtils';
 import { ChartEditorFormState } from '@/components/ChartEditor/types';
 import { getFirstTimestampValueExpression } from '@/source';
+import { getMetricTableName } from '@/utils';
 import {
   extendDateRangeToInterval,
   intervalToGranularity,
@@ -97,13 +113,26 @@ export function displayTypeToActiveTab(displayType: DisplayType): string {
       return 'table';
     case DisplayType.Pie:
       return 'pie';
+    case DisplayType.Bar:
+      return 'bar';
     case DisplayType.Number:
       return 'number';
     case DisplayType.Heatmap:
       return 'heatmap';
+    case DisplayType.EventPatterns:
+      return 'event_patterns';
     default:
       return 'time';
   }
+}
+
+/**
+ * Whether a tab queries data. Markdown is static content, so it gets no Run
+ * button, time range or dashboard filters, and no required filter can block
+ * its preview — the tab-level counterpart of `displayTypeRequiresSource`.
+ */
+export function tabQueriesData(activeTab: string): boolean {
+  return activeTab !== displayTypeToActiveTab(DisplayType.Markdown);
 }
 
 export const TABS_WITH_GENERATED_SQL = new Set([
@@ -111,6 +140,7 @@ export const TABS_WITH_GENERATED_SQL = new Set([
   'time',
   'number',
   'pie',
+  'bar',
   'heatmap',
 ]);
 
@@ -133,6 +163,120 @@ export function computeDbTimeChartConfig(
   };
 }
 
+/**
+ * Returns the dashboard variables a chart preview should use, narrowed to the
+ * ones the chart config references. When applySelections is false, return empty
+ * selections for each variable.
+ */
+export function resolvePreviewVariables({
+  config,
+  variables,
+  applySelections,
+}: {
+  config: ChartConfigWithDateRange;
+  variables: ChartVariable[] | undefined;
+  applySelections: boolean;
+}): ChartVariable[] | undefined {
+  if (!variables) return undefined;
+  const referenced = filterReferencedVariables(config, variables);
+  return applySelections
+    ? referenced
+    : referenced.map(variable => ({ ...variable, values: [] }));
+}
+
+/** What the dashboard's filter state contributes to a tile preview. */
+export type TilePreviewFilters = {
+  /** Broadcast filter conditions to query the preview with. */
+  filters: Filter[] | undefined;
+  /** The referenced variables, with or without their selections. */
+  variables: ChartVariable[] | undefined;
+  /** Names of the required filters that have nothing selected. */
+  missingRequiredFilterNames: string[];
+};
+
+/**
+ * Applies the parent dashboard's filter selections to a tile preview.
+ *
+ * With `applySelections` off, the preview runs as an alert would: no broadcast
+ * filters, empty variable selections, and no required-filter block.
+ */
+export function resolveTilePreviewFilters({
+  config,
+  sourceId,
+  filters,
+  variables,
+  unsatisfiedRequiredFilters,
+  applySelections,
+}: {
+  config: ChartConfigWithDateRange;
+  sourceId: string | undefined;
+  filters: Filter[] | undefined;
+  variables: ChartVariable[] | undefined;
+  unsatisfiedRequiredFilters: DashboardFilter[] | undefined;
+  applySelections: boolean;
+}): TilePreviewFilters {
+  const previewVariables = resolvePreviewVariables({
+    config,
+    variables,
+    applySelections,
+  });
+
+  if (!applySelections) {
+    return {
+      filters: undefined,
+      variables: previewVariables,
+      missingRequiredFilterNames: [],
+    };
+  }
+
+  const consumesBroadcastFilters = configConsumesBroadcastFilters(
+    config,
+    sourceId,
+  );
+
+  return {
+    filters: consumesBroadcastFilters ? filters : undefined,
+    variables: previewVariables,
+    missingRequiredFilterNames: getBlockingRequiredFilterNames({
+      config,
+      sourceId,
+      unsatisfiedRequiredFilters,
+      referencedVariables: previewVariables,
+    }),
+  };
+}
+
+/** A PromQL tile's substituted expression, or why there isn't one. */
+export type RenderedPromqlExpression =
+  | { expression: string; error?: never }
+  | { expression?: never; error: string };
+
+/** The expression a PromQL tile is queried with, with variables substituted. */
+export function buildRenderedPromqlExpression(
+  queriedConfig: ChartConfigWithDateRange | undefined,
+): RenderedPromqlExpression | undefined {
+  if (queriedConfig == null || !isPromqlChartConfig(queriedConfig)) {
+    return undefined;
+  }
+
+  try {
+    return {
+      expression:
+        substitutePromqlChartConfigVariables(queriedConfig).promqlExpression,
+    };
+  } catch (e) {
+    // Substitution throws on an unrecognized format such as `${svc:json}`. The
+    // query path substitutes the same way, so nothing reached Prometheus —
+    // showing the template here would claim an expression that never ran.
+    return {
+      error:
+        e instanceof Error
+          ? `Variables could not be expanded: ${e.message}`
+          : 'Variables could not be expanded.',
+    };
+  }
+}
+
 export function buildSampleEventsConfig(
   queriedConfig: ChartConfigWithDateRange | undefined,
   tableSource: TSource | undefined,
@@ -148,8 +292,13 @@ export function buildSampleEventsConfig(
     return null;
   }
 
+  // The series' agg conditions become `filters` below, and `filters` is
+  // deliberately not scanned for variable references. So expand the variables
+  // here, building the filters in the sample events config below.
+  const config = tryExpandConfigVariables(queriedConfig);
+
   return {
-    ...queriedConfig,
+    ...config,
     orderBy: [
       {
         ordering: 'DESC' as const,
@@ -168,7 +317,7 @@ export function buildSampleEventsConfig(
         tableSource.kind === SourceKind.Trace) &&
         tableSource.defaultTableSelectExpression) ||
       '',
-    filters: seriesToFilters(queriedConfig.select),
+    filters: seriesToFilters(config.select),
     filtersLogicalOperator: 'OR' as const,
     groupBy: undefined,
     granularity: undefined,
@@ -225,7 +374,7 @@ export function buildChartConfigForExplanations({
           }
         : undefined;
 
-  if (!config || isRawSqlChartConfig(config) || isPromqlChartConfig(config)) {
+  if (!config || !isBuilderChartConfig(config)) {
     return undefined;
   }
 
@@ -244,11 +393,61 @@ export function buildChartConfigForExplanations({
     return convertToNumberChartConfig(builderConfig);
   } else if (activeTab === 'table') {
     return convertToTableChartConfig(builderConfig);
-  } else if (activeTab === 'pie') {
-    return convertToPieChartConfig(builderConfig);
+  } else if (activeTab === 'pie' || activeTab === 'bar') {
+    return convertToCategoricalChartConfig(builderConfig);
   } else if (activeTab === 'heatmap') {
     return config;
   }
 
   return config;
+}
+
+/**
+ * Picks the table connection(s) that drive attribute autocomplete for the
+ * chart-level Group By.
+ *
+ * Metric sources have no single `from.tableName` (they fan out to per-type
+ * metric tables), so we build one connection per series' metric table + name
+ * (deduped) and ask the editor to offer only fields present in ALL of them
+ * (`intersectFields`). A ratio can mix metric types (e.g. gauge / sum) whose
+ * tables have different native columns — a union would suggest a column that
+ * only exists in one series and make the other series' query fail, so the Group
+ * By must be restricted to fields valid for every series.
+ *
+ * Non-metric sources (and metric sources with no resolvable series) fall back
+ * to the source's single `tableConnection`.
+ */
+export function buildGroupByConnectionProps({
+  tableSource,
+  series,
+  tableConnection,
+}: {
+  tableSource: TSource | undefined;
+  series: { metricType?: string; metricName?: string }[] | undefined;
+  tableConnection: TableConnection;
+}): TableConnectionChoice & { intersectFields?: boolean } {
+  if (tableSource?.kind !== SourceKind.Metric || !Array.isArray(series)) {
+    return { tableConnection };
+  }
+
+  const seen = new Set<string>();
+  const connections: TableConnection[] = [];
+  for (const s of series) {
+    if (!s?.metricType || !s?.metricName) continue;
+    const metricTable = getMetricTableName(tableSource, s.metricType);
+    if (!metricTable) continue;
+    const key = `${metricTable}::${s.metricName}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    connections.push({
+      databaseName: tableSource.from.databaseName,
+      tableName: metricTable,
+      connectionId: tableSource.connection,
+      metricName: s.metricName,
+    });
+  }
+
+  return connections.length > 0
+    ? { tableConnections: connections, intersectFields: true }
+    : { tableConnection };
 }

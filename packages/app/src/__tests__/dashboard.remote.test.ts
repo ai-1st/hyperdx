@@ -6,7 +6,13 @@
 // `jest.isolateModules` did not override the hoisted `jest.mock` factory
 // reliably enough to share a file.
 jest.mock('../config', () => ({ IS_LOCAL_MODE: false }));
-jest.mock('../api', () => ({ hdxServer: jest.fn() }));
+jest.mock('../api', () => ({
+  __esModule: true,
+  default: { useMe: () => ({ data: null }) },
+  hdxServer: jest.fn(),
+  useMarkOnboardingTaskComplete: () => jest.fn(),
+  useCompleteOnboardingTask: () => ({ mutate: jest.fn() }),
+}));
 jest.mock('@mantine/notifications', () => ({
   notifications: { show: jest.fn() },
 }));
@@ -32,13 +38,13 @@ jest.mock('@/utils', () => ({ hashCode: jest.fn(() => 0) }));
 
 import { LEGACY_CHART_PALETTE_TOKEN_MAP } from '@hyperdx/common-utils/dist/types';
 
-import { hdxServer } from '../api';
+import { hdxServer } from '@/api';
 import {
   fetchDashboards,
   normalizeRawDashboardTileColors,
   useCreateDashboard,
   useUpdateDashboard,
-} from '../dashboard';
+} from '@/dashboard';
 
 const hdxServerMock = hdxServer as jest.Mock;
 

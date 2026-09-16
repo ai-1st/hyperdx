@@ -1,7 +1,7 @@
 import React, {
   memo,
+  use,
   useCallback,
-  useContext,
   useEffect,
   useMemo,
   useState,
@@ -37,7 +37,6 @@ import {
 import {
   BuilderChartConfigWithDateRange,
   SelectList,
-  SourceKind,
   TSource,
 } from '@hyperdx/common-utils/dist/types';
 import {
@@ -72,6 +71,7 @@ import {
 import { useVirtualizer } from '@tanstack/react-virtual';
 
 import api from '@/api';
+import { useChartSyncId } from '@/chartSync';
 import { searchChartConfigDefaults } from '@/defaults';
 import {
   useAliasMapFromChartConfig,
@@ -87,7 +87,7 @@ import useRowWhere, {
   WithClause,
 } from '@/hooks/useRowWhere';
 import { useTableSearch } from '@/hooks/useTableSearch';
-import { useSource } from '@/source';
+import { getLevelExpression, useSource } from '@/source';
 import {
   MIN_COLUMN_WIDTH,
   MIN_LAST_COLUMN_WIDTH,
@@ -124,7 +124,7 @@ import {
 } from './ExpandableRowTable';
 import LogLevel from './LogLevel';
 
-import styles from '../../styles/LogTable.module.scss';
+import styles from '@styles/LogTable.module.scss';
 
 type Row = Record<string, any> & { duration: number };
 type AccessorFn = (row: Row, column: string) => any;
@@ -135,7 +135,6 @@ const SPECIAL_VALUES = {
 const ACCESSOR_MAP: Record<string, AccessorFn> = {
   duration: row =>
     row.duration >= 0 ? row.duration : SPECIAL_VALUES.not_available,
-  severityText: row => row.severityText ?? row.statusCode,
   default: (row, column) => row[column],
 };
 
@@ -217,6 +216,7 @@ const PatternTrendChart = ({
   dateRange: [Date, Date];
   color?: string;
 }) => {
+  const syncId = useChartSyncId();
   return (
     <div
       // Hack, recharts will release real fix soon https://github.com/recharts/recharts/issues/172
@@ -240,7 +240,7 @@ const PatternTrendChart = ({
             width={500}
             height={300}
             data={data}
-            syncId="hdx"
+            syncId={syncId}
             syncMethod="value"
             margin={{ top: 4, left: 0, right: 4, bottom: 0 }}
           >
@@ -593,10 +593,7 @@ export const RawLogTable = memo(
                     <PatternTrendChart
                       data={value.data}
                       dateRange={value.dateRange}
-                      color={logLevelColor(
-                        info.row.original.severityText ??
-                          info.row.original.statusCode,
-                      )}
+                      color={logLevelColor(info.row.original.level)}
                     />
                   </div>
                 );
@@ -684,6 +681,7 @@ export const RawLogTable = memo(
           if (
             scrollHeight - scrollTop - clientHeight < FETCH_NEXT_PAGE_PX &&
             !isLoading &&
+            !isError &&
             hasNextPage
           ) {
             // Cancel refetch is important to ensure we wait for the last fetch to finish
@@ -691,7 +689,7 @@ export const RawLogTable = memo(
           }
         }
       },
-      [fetchNextPage, isLoading, hasNextPage],
+      [fetchNextPage, isLoading, isError, hasNextPage],
     );
 
     //a check on mount and after a fetch to see if the table is already scrolled to the bottom and immediately needs to fetch more data
@@ -885,6 +883,7 @@ export const RawLogTable = memo(
         if (
           dedupedRows.length < MAX_SCROLL_FETCH_LINES &&
           !isLoading &&
+          !isError &&
           hasNextPage
         ) {
           fetchNextPage?.({ cancelRefetch: false });
@@ -906,6 +905,7 @@ export const RawLogTable = memo(
       rowVirtualizer,
       scrolledToHighlightedLine,
       isLoading,
+      isError,
       hasNextPage,
     ]);
 
@@ -1520,10 +1520,14 @@ function DBSqlRowTableComponent({
   enableSmallFirstWindow,
   tableId,
   errorVariant,
+  onResolvedColumnsChange,
 }: {
   config: BuilderChartConfigWithDateRange;
   sourceId?: string;
-  onRowDetailsClick?: (rowWhere: RowWhereResult) => void;
+  onRowDetailsClick?: (
+    rowWhere: RowWhereResult,
+    row: Record<string, any>,
+  ) => void;
   highlightedLineId?: string;
   queryKeyPrefix?: string;
   enabled?: boolean;
@@ -1546,10 +1550,11 @@ function DBSqlRowTableComponent({
   enableSmallFirstWindow?: boolean;
   tableId?: string;
   errorVariant?: ChartErrorStateVariant;
+  onResolvedColumnsChange?: (meta: ColumnMetaType[]) => void;
 }) {
   const { data: me } = api.useMe();
   const { toggleColumn, displayedColumns: contextDisplayedColumns } =
-    useContext(RowSidePanelContext);
+    use(RowSidePanelContext);
 
   const [orderBy, setOrderBy] = useState<SortingState[number] | null>(
     initialSortBy?.[0] ?? null,
@@ -1705,7 +1710,7 @@ function DBSqlRowTableComponent({
 
   const _onRowDetailsClick = useCallback(
     (row: Record<string, any>) => {
-      return onRowDetailsClick?.(getRowWhere(row));
+      return onRowDetailsClick?.(getRowWhere(row), row);
     },
     [onRowDetailsClick, getRowWhere],
   );
@@ -1716,16 +1721,21 @@ function DBSqlRowTableComponent({
     }
   }, [isError, onError, error]);
 
+  // Surface the result-set column types upward.
+  // `data?.meta` keeps a stable identity per query result.
+  useEffect(() => {
+    if (data?.meta != null && data.meta.length > 0) {
+      onResolvedColumnsChange?.(data.meta);
+    }
+  }, [data?.meta, onResolvedColumnsChange]);
+
   const { data: source } = useSource({ id: sourceId });
   const patternColumn = columns[columns.length - 1];
   const groupedPatterns = useGroupedPatterns({
     config,
     samples: DENOISE_SAMPLE_SIZE,
     bodyValueExpression: patternColumn ?? '',
-    severityTextExpression:
-      (source?.kind === SourceKind.Log
-        ? source.severityTextExpression
-        : undefined) ?? '',
+    levelExpression: getLevelExpression(source),
     totalCount: undefined,
     enabled: denoiseResults,
   });

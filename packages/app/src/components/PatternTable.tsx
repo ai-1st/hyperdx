@@ -11,6 +11,7 @@ import { SQLPreview } from '@/components/ChartSQLPreview';
 import { RawLogTable } from '@/components/DBRowTable';
 import { useSearchTotalCount } from '@/components/SearchTotalCountChart';
 import { Pattern, useGroupedPatterns } from '@/hooks/usePatterns';
+import { getLevelExpression } from '@/source';
 
 import {
   buildPatternColumnExpression,
@@ -25,10 +26,10 @@ export default function PatternTable({
   totalCountConfig,
   totalCountQueryKeyPrefix,
   bodyValueExpression,
-  patternColumn,
-  draftPatternColumn,
-  onDraftPatternColumnChange,
-  onSubmit,
+  patternColumn: externalPatternColumn,
+  draftPatternColumn: externalDraftPatternColumn,
+  onDraftPatternColumnChange: externalOnDraftPatternColumnChange,
+  onSubmit: externalOnSubmit,
   source,
 }: {
   config: BuilderChartConfigWithDateRange;
@@ -45,8 +46,16 @@ export default function PatternTable({
 
   const [selectedPattern, setSelectedPattern] = useState<Pattern | null>(null);
 
+  // When external handlers are provided (e.g. search page), the pattern
+  // column selector is shown inline and the user can override the expression
+  // at runtime. For dashboard/preview tiles, the pattern expression is
+  // configured in the tile edit UI (via the config's `select` field) and
+  // the PatternColumnSelector is not shown.
+  const hasExternalPatternColumn =
+    externalOnDraftPatternColumnChange != null && externalOnSubmit != null;
+
   const effectiveBodyValueExpression = buildPatternColumnExpression({
-    patternColumn,
+    patternColumn: externalPatternColumn ?? null,
     fallback: bodyValueExpression,
   });
 
@@ -66,10 +75,11 @@ export default function PatternTable({
     config,
     samples: SAMPLES,
     bodyValueExpression: effectiveBodyValueExpression,
-    severityTextExpression:
-      (source?.kind === SourceKind.Log && source.severityTextExpression) || '',
-    statusCodeExpression:
-      (source?.kind === SourceKind.Trace && source.statusCodeExpression) || '',
+    levelExpression: getLevelExpression(source),
+    serviceNameExpression:
+      ((source?.kind === SourceKind.Log || source?.kind === SourceKind.Trace) &&
+        source.serviceNameExpression) ||
+      '',
     totalCount,
   });
 
@@ -86,14 +96,16 @@ export default function PatternTable({
 
   return (
     <>
-      <PatternColumnSelector
-        sourceId={source?.id}
-        value={draftPatternColumn ?? ''}
-        onChange={onDraftPatternColumnChange}
-        onSubmit={onSubmit}
-        dateRange={config.dateRange}
-        bodyValueExpression={bodyValueExpression}
-      />
+      {hasExternalPatternColumn && (
+        <PatternColumnSelector
+          sourceId={source?.id}
+          value={externalDraftPatternColumn ?? ''}
+          onChange={externalOnDraftPatternColumnChange}
+          onSubmit={externalOnSubmit}
+          dateRange={config.dateRange}
+          bodyValueExpression={bodyValueExpression}
+        />
+      )}
       {error ? (
         <Container style={{ overflow: 'auto' }}>
           <Box mt="lg">
@@ -135,7 +147,7 @@ export default function PatternTable({
             displayedColumns={[
               '__hdx_pattern_trend',
               'countStr',
-              'severityText',
+              'level',
               'pattern',
             ]}
             onRowDetailsClick={row => setSelectedPattern(row as Pattern)}
@@ -148,7 +160,7 @@ export default function PatternTable({
               __hdx_pattern_trend: 'Trend',
               countStr: 'Count',
               pattern: 'Pattern',
-              severityText: 'Level',
+              level: 'Level',
             }}
             config={patternQueryConfig}
             showExpandButton={false}

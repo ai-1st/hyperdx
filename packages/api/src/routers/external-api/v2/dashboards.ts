@@ -2,7 +2,10 @@ import express from 'express';
 import { uniq } from 'lodash';
 import { z } from 'zod';
 
-import { deleteDashboard } from '@/controllers/dashboard';
+import {
+  deleteDashboard,
+  recordDashboardOnboardingIfHasTiles,
+} from '@/controllers/dashboard';
 import Dashboard, { IDashboard } from '@/models/dashboard';
 import { processRequestWithEnhancedErrors as validateRequest } from '@/utils/enhancedErrors';
 import { ExternalDashboardTileWithId, objectIdSchema } from '@/utils/zod';
@@ -52,6 +55,14 @@ const EXTERNAL_DASHBOARD_PROJECTION = {
  *       enum: [sql, lucene]
  *       description: Query language for the where clause.
  *     SavedFilterValue:
+ *       description: >
+ *         A single saved dashboard filter selection. Either a rendered SQL
+ *         condition, or a selection addressed by the name of the dashboard
+ *         variable it belongs to.
+ *       oneOf:
+ *         - $ref: '#/components/schemas/SqlSavedFilterValue'
+ *         - $ref: '#/components/schemas/VariableSavedFilterValue'
+ *     SqlSavedFilterValue:
  *       type: object
  *       required: [condition]
  *       properties:
@@ -59,12 +70,38 @@ const EXTERNAL_DASHBOARD_PROJECTION = {
  *           type: string
  *           enum: [sql]
  *           default: sql
- *           description: Filter type. Currently only "sql" is supported.
+ *           description: Filter type.
  *           example: "sql"
  *         condition:
  *           type: string
+ *           maxLength: 10000
  *           description: SQL filter condition. For example use expressions in the form "column IN ('value')".
  *           example: "ServiceName IN ('hdx-oss-dev-api')"
+ *     VariableSavedFilterValue:
+ *       type: object
+ *       required: [type, name, values]
+ *       properties:
+ *         type:
+ *           type: string
+ *           enum: [variable]
+ *           description: Filter type.
+ *           example: "variable"
+ *         name:
+ *           type: string
+ *           minLength: 1
+ *           maxLength: 1024
+ *           description: >
+ *             The variableName of the dashboard variable this selection
+ *             belongs to. Only allowed for variable-enabled filters.
+ *           example: "service"
+ *         values:
+ *           type: array
+ *           maxItems: 1000
+ *           description: Selected values
+ *           items:
+ *             type: string
+ *             maxLength: 10000
+ *           example: ["hdx-oss-dev-api"]
  *     MetricDataType:
  *       type: string
  *       enum: [sum, gauge, histogram, summary, exponential histogram]
@@ -129,6 +166,26 @@ const EXTERNAL_DASHBOARD_PROJECTION = {
  *         Palette token used to color a number tile. Tokens reflow across
  *         light and dark themes, so raw hex values are not accepted.
  *       example: "chart-red"
+ *     BackgroundChart:
+ *       type: object
+ *       required:
+ *         - type
+ *       description: >
+ *         Optional background trend sparkline drawn behind a number tile's
+ *         value, derived from a time-bucketed version of the tile's query.
+ *         Builder number tiles only (raw SQL number tiles have no time
+ *         dimension to bucket).
+ *       properties:
+ *         type:
+ *           type: string
+ *           enum: [line, area]
+ *           description: Sparkline shape.
+ *           example: "line"
+ *         color:
+ *           $ref: '#/components/schemas/ChartPaletteToken'
+ *           description: >
+ *             Optional palette-token override for the sparkline. When unset
+ *             the sparkline inherits the tile's static color.
  *     NumericColorCondition:
  *       type: object
  *       required:
@@ -552,6 +609,37 @@ const EXTERNAL_DASHBOARD_PROJECTION = {
  *             Per-series number formatting options. When set, takes precedence
  *             over the chart-level numberFormat for this select item only.
  *
+ *     Formula:
+ *       type: object
+ *       required:
+ *         - expression
+ *       description: >
+ *         A derived series computed from the chart's select items via a
+ *         letter-ref arithmetic expression (metric, log, and trace sources
+ *         only). "A" refers
+ *         to select[0], "B" to select[1], and so on. The grammar supports
+ *         + - * /, parentheses, and numeric constants; expressions are parsed
+ *         and validated, never passed through as raw SQL. Division by zero or
+ *         a missing operand yields NULL (rendered as a gap).
+ *       properties:
+ *         expression:
+ *           type: string
+ *           maxLength: 1024
+ *           description: >
+ *             Arithmetic expression over the select items by position, e.g.
+ *             "A / (A + B) * 100" for a success-rate percentage.
+ *           example: "A / (A + B) * 100"
+ *         alias:
+ *           type: string
+ *           description: >
+ *             Display label for the formula series in chart legends and column
+ *             headers. Falls back to the raw expression text when unset.
+ *           example: "Success rate %"
+ *         numberFormat:
+ *           $ref: '#/components/schemas/NumberFormat'
+ *           description: >
+ *             Per-series number formatting options for the formula series.
+ *
  *     LineBuilderChartConfig:
  *       type: object
  *       required:
@@ -609,6 +697,29 @@ const EXTERNAL_DASHBOARD_PROJECTION = {
  *           type: boolean
  *           description: Overlay the equivalent previous time period for comparison.
  *           default: false
+ *         seriesLimit:
+ *           type: integer
+ *           minimum: 0
+ *           description: >
+ *             Maximum number of series rendered (top-N by value). Omit to use
+ *             the default render cap, set 0 for unlimited, or a positive N to
+ *             keep the top N series.
+ *           example: 5
+ *         formulas:
+ *           type: array
+ *           maxItems: 10
+ *           description: >
+ *             Derived series computed from the select items via letter-ref
+ *             arithmetic ("A" = select[0], "B" = select[1], ...). Metric,
+ *             log, and trace sources only. Cannot be combined with asRatio.
+ *           items:
+ *             $ref: '#/components/schemas/Formula'
+ *         showOperandSeries:
+ *           type: boolean
+ *           description: >
+ *             Only meaningful with formulas. When false, only the formula
+ *             series are returned; the raw operand series are hidden.
+ *           default: true
  *
  *     BarBuilderChartConfig:
  *       type: object
@@ -656,6 +767,29 @@ const EXTERNAL_DASHBOARD_PROJECTION = {
  *         numberFormat:
  *           $ref: '#/components/schemas/NumberFormat'
  *           description: Number formatting options for displayed values.
+ *         seriesLimit:
+ *           type: integer
+ *           minimum: 0
+ *           description: >-
+ *             Maximum number of series rendered (top-N by value). Omit to use
+ *             the default render cap, set 0 for unlimited, or a positive N to
+ *             keep the top N series.
+ *           example: 5
+ *         formulas:
+ *           type: array
+ *           maxItems: 10
+ *           description: >
+ *             Derived series computed from the select items via letter-ref
+ *             arithmetic ("A" = select[0], "B" = select[1], ...). Metric,
+ *             log, and trace sources only. Cannot be combined with asRatio.
+ *           items:
+ *             $ref: '#/components/schemas/Formula'
+ *         showOperandSeries:
+ *           type: boolean
+ *           description: >
+ *             Only meaningful with formulas. When false, only the formula
+ *             series are returned; the raw operand series are hidden.
+ *           default: true
  *
  *     TableBuilderChartConfig:
  *       type: object
@@ -715,6 +849,21 @@ const EXTERNAL_DASHBOARD_PROJECTION = {
  *         onClick:
  *           $ref: '#/components/schemas/OnClick'
  *           description: Optional link-out configuration applied when a user clicks a row.
+ *         formulas:
+ *           type: array
+ *           maxItems: 10
+ *           description: >
+ *             Derived columns computed from the select items via letter-ref
+ *             arithmetic ("A" = select[0], "B" = select[1], ...). Metric,
+ *             log, and trace sources only. Cannot be combined with asRatio.
+ *           items:
+ *             $ref: '#/components/schemas/Formula'
+ *         showOperandSeries:
+ *           type: boolean
+ *           description: >
+ *             Only meaningful with formulas. When false, only the formula
+ *             columns are returned; the raw operand columns are hidden.
+ *           default: true
  *
  *     NumberBuilderChartConfig:
  *       type: object
@@ -736,10 +885,25 @@ const EXTERNAL_DASHBOARD_PROJECTION = {
  *         select:
  *           type: array
  *           minItems: 1
- *           maxItems: 1
- *           description: Exactly one aggregated value to display as a single number.
+ *           maxItems: 20
+ *           description: >
+ *             Exactly one aggregated value to display as a single number —
+ *             unless "formulas" is set, in which case the select items are
+ *             the formula's operands and the (single) formula value is
+ *             displayed instead.
  *           items:
  *             $ref: '#/components/schemas/SelectItem'
+ *         formulas:
+ *           type: array
+ *           maxItems: 1
+ *           description: >
+ *             A single derived value computed from the select items via
+ *             letter-ref arithmetic ("A" = select[0], "B" = select[1], ...).
+ *             Metric, log, and trace sources only. Number tiles display the
+ *             formula value and
+ *             always hide the operand series.
+ *           items:
+ *             $ref: '#/components/schemas/Formula'
  *         numberFormat:
  *           $ref: '#/components/schemas/NumberFormat'
  *           description: Number formatting options for displayed values.
@@ -755,6 +919,10 @@ const EXTERNAL_DASHBOARD_PROJECTION = {
  *             text color when no rule matches.
  *           items:
  *             $ref: '#/components/schemas/NumberTileColorCondition'
+ *         backgroundChart:
+ *           $ref: '#/components/schemas/BackgroundChart'
+ *           description: >
+ *             Optional background trend sparkline drawn behind the value.
  *
  *     PieBuilderChartConfig:
  *       type: object
@@ -785,9 +953,79 @@ const EXTERNAL_DASHBOARD_PROJECTION = {
  *           maxLength: 10000
  *           description: Field expression to group results by (one slice per group value).
  *           example: "service"
+ *         orderBy:
+ *           type: string
+ *           maxLength: 10000
+ *           description: >
+ *             Optional custom SQL ORDER BY expression (raw SQL). Overrides the
+ *             default value-descending ordering and, when combined with
+ *             "limit", controls which slices are kept.
+ *           example: "\"Count\" DESC"
  *         numberFormat:
  *           $ref: '#/components/schemas/NumberFormat'
  *           description: Number formatting options for displayed values.
+ *         limit:
+ *           type: integer
+ *           minimum: 0
+ *           description: >
+ *             Maximum number of slices (SQL LIMIT). Without a custom "orderBy"
+ *             the query keeps the groups with the largest aggregated values;
+ *             with an "orderBy" it keeps the first slices in that order. Omit
+ *             or set 0 to fetch all groups.
+ *           example: 10
+ *
+ *     CategoricalBarBuilderChartConfig:
+ *       type: object
+ *       required:
+ *         - displayType
+ *         - sourceId
+ *         - select
+ *       description: >
+ *         Builder configuration for a categorical bar chart tile. Each bar
+ *         represents one group value. Distinct from stacked_bar, which is a
+ *         time-series chart.
+ *       properties:
+ *         displayType:
+ *           type: string
+ *           enum: [bar]
+ *           description: Display type discriminator. Must be "bar" for categorical bar charts.
+ *           example: "bar"
+ *         sourceId:
+ *           type: string
+ *           description: ID of the data source to query.
+ *           example: "65f5e4a3b9e77c001a111111"
+ *         select:
+ *           type: array
+ *           minItems: 1
+ *           maxItems: 1
+ *           description: Exactly one aggregated value used to size each bar.
+ *           items:
+ *             $ref: '#/components/schemas/SelectItem'
+ *         groupBy:
+ *           type: string
+ *           maxLength: 10000
+ *           description: Field expression to group results by (one bar per group value).
+ *           example: "service"
+ *         orderBy:
+ *           type: string
+ *           maxLength: 10000
+ *           description: >
+ *             Optional custom SQL ORDER BY expression (raw SQL). Overrides the
+ *             default value-descending ordering and, when combined with
+ *             "limit", controls which bars are kept.
+ *           example: "\"Count\" DESC"
+ *         numberFormat:
+ *           $ref: '#/components/schemas/NumberFormat'
+ *           description: Number formatting options for displayed values.
+ *         limit:
+ *           type: integer
+ *           minimum: 0
+ *           description: >
+ *             Maximum number of bars (SQL LIMIT). Without a custom "orderBy"
+ *             the query keeps the groups with the largest aggregated values;
+ *             with an "orderBy" it keeps the first bars in that order. Omit or
+ *             set 0 to fetch all groups.
+ *           example: 10
  *
  *     HeatmapSelectItem:
  *       type: object
@@ -892,6 +1130,38 @@ const EXTERNAL_DASHBOARD_PROJECTION = {
  *           type: string
  *           maxLength: 10000
  *           description: Filter condition for the search (syntax depends on whereLanguage).
+ *           default: ""
+ *           example: "level:error"
+ *         whereLanguage:
+ *           $ref: '#/components/schemas/QueryLanguage'
+ *           description: Query language for the where clause.
+ *
+ *     EventPatternsChartConfig:
+ *       type: object
+ *       required:
+ *         - displayType
+ *         - sourceId
+ *       description: Configuration for an event pattern mining tile. Clusters log or trace events by recurring message shapes.
+ *       properties:
+ *         displayType:
+ *           type: string
+ *           enum: [event_patterns]
+ *           description: Display type discriminator. Must be "event_patterns" for pattern mining tiles.
+ *           example: "event_patterns"
+ *         sourceId:
+ *           type: string
+ *           description: ID of the data source to mine patterns from.
+ *           example: "65f5e4a3b9e77c001a111111"
+ *         select:
+ *           type: string
+ *           maxLength: 10000
+ *           description: Column or expression to mine patterns from. Leave empty to use the source default (Body for logs, SpanName for traces).
+ *           default: ""
+ *           example: "Body"
+ *         where:
+ *           type: string
+ *           maxLength: 10000
+ *           description: Filter condition for the pattern mining query (syntax depends on whereLanguage).
  *           default: ""
  *           example: "level:error"
  *         whereLanguage:
@@ -1032,9 +1302,16 @@ const EXTERNAL_DASHBOARD_PROJECTION = {
  *               example: "number"
  *             color:
  *               $ref: '#/components/schemas/ChartPaletteToken'
+ *               description: Optional static color applied to the displayed number.
+ *             colorRules:
+ *               type: array
+ *               maxItems: 10
  *               description: >
- *                 Optional static color applied to the displayed number. Raw
- *                 SQL number tiles do not support conditional colorRules.
+ *                 Ordered conditional color rules evaluated against the displayed
+ *                 value (last match wins). Falls back to color, then the default
+ *                 text color when no rule matches.
+ *               items:
+ *                 $ref: '#/components/schemas/NumberTileColorCondition'
  *
  *     PieRawSqlChartConfig:
  *       description: Raw SQL configuration for a pie chart.
@@ -1049,6 +1326,20 @@ const EXTERNAL_DASHBOARD_PROJECTION = {
  *               enum: [pie]
  *               description: Display as a pie chart.
  *               example: "pie"
+ *
+ *     CategoricalBarRawSqlChartConfig:
+ *       description: Raw SQL configuration for a categorical bar chart.
+ *       allOf:
+ *         - $ref: '#/components/schemas/RawSqlChartConfigBase'
+ *         - type: object
+ *           required:
+ *             - displayType
+ *           properties:
+ *             displayType:
+ *               type: string
+ *               enum: [bar]
+ *               description: Display as a categorical bar chart.
+ *               example: "bar"
  *
  *     LineChartConfig:
  *       description: >
@@ -1191,6 +1482,27 @@ const EXTERNAL_DASHBOARD_PROJECTION = {
  *           items:
  *             $ref: '#/components/schemas/OnClickFilterTemplate'
  *
+ *     OnClickExternal:
+ *       type: object
+ *       required: [type, urlTemplate]
+ *       description: >
+ *         Link-out that navigates to an arbitrary external URL (e.g. a Grafana
+ *         or Langfuse dashboard). The rendered URL must be an absolute http(s) URL.
+ *       properties:
+ *         type:
+ *           type: string
+ *           enum: [external]
+ *           description: OnClick variant discriminator. Must be "external" for external link-outs.
+ *           example: "external"
+ *         urlTemplate:
+ *           type: string
+ *           minLength: 1
+ *           description: >
+ *             Handlebars template rendered against the clicked row; supports
+ *             `{{column}}` variables. The rendered value must be an absolute
+ *             http(s) URL.
+ *           example: "https://example.com/d/abc?var-service={{ServiceName}}"
+ *
  *     OnClick:
  *       description: >
  *         Link-out configuration applied when a user clicks a row of a table tile.
@@ -1200,11 +1512,13 @@ const EXTERNAL_DASHBOARD_PROJECTION = {
  *       oneOf:
  *         - $ref: '#/components/schemas/OnClickSearch'
  *         - $ref: '#/components/schemas/OnClickDashboard'
+ *         - $ref: '#/components/schemas/OnClickExternal'
  *       discriminator:
  *         propertyName: type
  *         mapping:
  *           search: '#/components/schemas/OnClickSearch'
  *           dashboard: '#/components/schemas/OnClickDashboard'
+ *           external: '#/components/schemas/OnClickExternal'
  *
  *     TableChartConfig:
  *       description: >
@@ -1245,22 +1559,38 @@ const EXTERNAL_DASHBOARD_PROJECTION = {
  *         mapping:
  *           sql: '#/components/schemas/PieRawSqlChartConfig'
  *
+ *     CategoricalBarChartConfig:
+ *       description: >
+ *         Categorical bar chart (one bar per group value; not a time series).
+ *         Omit configType for the builder variant (requires sourceId and
+ *         select). Set configType to "sql" for the Raw SQL variant (requires
+ *         connectionId and sqlTemplate).
+ *       oneOf:
+ *         - $ref: '#/components/schemas/CategoricalBarBuilderChartConfig'
+ *         - $ref: '#/components/schemas/CategoricalBarRawSqlChartConfig'
+ *       discriminator:
+ *         propertyName: configType
+ *         mapping:
+ *           sql: '#/components/schemas/CategoricalBarRawSqlChartConfig'
+ *
  *     TileConfig:
  *       description: >
  *         Tile chart configuration. displayType is the primary discriminant and
  *         determines which variant group applies. For displayTypes that support
- *         both builder and Raw SQL modes (line, stacked_bar, table, number, pie),
- *         configType is the secondary discriminant: omit it for the builder
+ *         both builder and Raw SQL modes (line, stacked_bar, table, number, pie,
+ *         bar), configType is the secondary discriminant: omit it for the builder
  *         variant or set it to "sql" for the Raw SQL variant. The heatmap,
- *         search, and markdown displayTypes only have a builder variant.
+ *         search, event_patterns, and markdown displayTypes only have a builder variant.
  *       oneOf:
  *         - $ref: '#/components/schemas/LineChartConfig'
  *         - $ref: '#/components/schemas/BarChartConfig'
  *         - $ref: '#/components/schemas/TableChartConfig'
  *         - $ref: '#/components/schemas/NumberChartConfig'
  *         - $ref: '#/components/schemas/PieChartConfig'
+ *         - $ref: '#/components/schemas/CategoricalBarChartConfig'
  *         - $ref: '#/components/schemas/HeatmapChartConfig'
  *         - $ref: '#/components/schemas/SearchChartConfig'
+ *         - $ref: '#/components/schemas/EventPatternsChartConfig'
  *         - $ref: '#/components/schemas/MarkdownChartConfig'
  *       discriminator:
  *         propertyName: displayType
@@ -1270,8 +1600,10 @@ const EXTERNAL_DASHBOARD_PROJECTION = {
  *           table: '#/components/schemas/TableChartConfig'
  *           number: '#/components/schemas/NumberChartConfig'
  *           pie: '#/components/schemas/PieChartConfig'
+ *           bar: '#/components/schemas/CategoricalBarChartConfig'
  *           heatmap: '#/components/schemas/HeatmapChartConfig'
  *           search: '#/components/schemas/SearchChartConfig'
+ *           event_patterns: '#/components/schemas/EventPatternsChartConfig'
  *           markdown: '#/components/schemas/MarkdownChartConfig'
  *
  *     DashboardContainerTab:
@@ -1431,8 +1763,31 @@ const EXTERNAL_DASHBOARD_PROJECTION = {
  *                 $ref: '#/components/schemas/DashboardChartSeries'
  *
  *     FilterInput:
+ *       description: |
+ *         A drop-down filter on a dashboard. Depending on type, filters can either broadcast
+ *         selected value(s) to every tile (isBroadcastEnabled), expose selected
+ *         values as a variable (isVariableEnabled) or both. Typically a filter should
+ *         do just one of these things. Any filter may additionally be marked
+ *         required via minSelections, which blocks the tiles that read it until it
+ *         has a selected value - or every tile on the dashboard, with
+ *         isGlobalRequirement.
+ *       oneOf:
+ *         - $ref: '#/components/schemas/QueryExpressionFilterInput'
+ *         - $ref: '#/components/schemas/StaticListFilterInput'
+ *         - $ref: '#/components/schemas/PrometheusLabelFilterInput'
+ *       discriminator:
+ *         propertyName: type
+ *         mapping:
+ *           QUERY_EXPRESSION: '#/components/schemas/QueryExpressionFilterInput'
+ *           STATIC_LIST: '#/components/schemas/StaticListFilterInput'
+ *           PROMETHEUS_LABEL: '#/components/schemas/PrometheusLabelFilterInput'
+ *
+ *     QueryExpressionFilterInput:
  *       type: object
- *       description: Dashboard filter key that can be added to a dashboard
+ *       description: |
+ *         A filter whose dropdown values are queried from ClickHouse: "expression"
+ *         names the column and "sourceId" the source to read them from. Its
+ *         selection can be broadcast into matching tiles' WHERE clauses.
  *       required:
  *         - type
  *         - name
@@ -1442,7 +1797,7 @@ const EXTERNAL_DASHBOARD_PROJECTION = {
  *         type:
  *           type: string
  *           enum: [QUERY_EXPRESSION]
- *           description: Filter type. Must be "QUERY_EXPRESSION".
+ *           description: Filter type discriminator. Must be "QUERY_EXPRESSION".
  *           example: "QUERY_EXPRESSION"
  *         name:
  *           type: string
@@ -1452,7 +1807,7 @@ const EXTERNAL_DASHBOARD_PROJECTION = {
  *         expression:
  *           type: string
  *           minLength: 1
- *           description: Key expression used when applying this dashboard filter key
+ *           description: SQL expression used when querying values for this filter, and when applying this dashboard filter to tiles.
  *           example: "environment"
  *         sourceId:
  *           type: string
@@ -1482,8 +1837,233 @@ const EXTERNAL_DASHBOARD_PROJECTION = {
  *             an empty array to apply the filter to ALL tiles regardless of source.
  *             A non-empty array restricts the filter to only tiles whose source ID
  *             is in the list; tiles using other sources are not affected by the
- *             selected filter value(s).
+ *             selected filter value(s). Scopes the broadcast condition only, so a
+ *             non-empty array is rejected when isBroadcastEnabled is false, and is
+ *             omitted from responses for such a filter.
  *           example: ["65f5e4a3b9e77c001a111111"]
+ *         isBroadcastEnabled:
+ *           type: boolean
+ *           description: |
+ *             Whether the selected value is applied as a filter condition on every
+ *             builder tile this filter applies to (see appliesToSourceIds), and every
+ *             raw sql tile using the $__filters macro. Omitting the field means enabled.
+ *           default: true
+ *           example: false
+ *         isVariableEnabled:
+ *           type: boolean
+ *           description: |
+ *             Whether the selected value is exposed to tile queries as a dashboard
+ *             variable named by variableName. Tiles may reference it as `$variableName`
+ *             or using the (preferred) `$__filter($<variableName>)` and
+ *             `$__conditionalAll(<condition>, $<variableName>)` macros.
+ *           default: false
+ *           example: true
+ *         variableName:
+ *           type: string
+ *           maxLength: 64
+ *           pattern: '^[a-zA-Z][a-zA-Z0-9_]*$'
+ *           description: |
+ *             Token tiles reference this filter's selected value by, as
+ *             `$variableName`. Must start with a letter and may contain only
+ *             letters, numbers, and underscores. Defaults to the display name with
+ *             whitespace replaced by underscores and remaining illegal characters
+ *             removed, so a variable-enabled filter whose name derives nothing
+ *             usable must send this field explicitly. Variable names must be unique
+ *             across a dashboard's variable-enabled filters. Names the variable
+ *             only, so the field is rejected when isVariableEnabled is not true, and
+ *             is omitted from responses for such a filter.
+ *           example: "environment"
+ *         minSelections:
+ *           type: integer
+ *           enum: [0, 1]
+ *           default: 0
+ *           description: |
+ *             Minimum number of values that must be selected before tiles load.
+ *             Set to 1 to make the filter required. Only 0 and 1 are accepted.
+ *             Omit the field (or send 0) for the default optional behavior.
+ *           example: 1
+ *         isGlobalRequirement:
+ *           type: boolean
+ *           default: false
+ *           description: |
+ *             Widens a required filter's block to every tile on the dashboard. False
+ *             (the default) blocks only the tiles that read the filter: those
+ *             referencing its variableName, and those its broadcast applies to.
+ *             Ignored unless minSelections is 1.
+ *           example: true
+ *
+ *     StaticListFilterInput:
+ *       type: object
+ *       description: |
+ *         A filter whose dropdown offers a static custom "options" list. It carries no
+ *         expression, so it cannot be broadcast, and supports only variable mode.
+ *       required:
+ *         - type
+ *         - name
+ *         - options
+ *       properties:
+ *         type:
+ *           type: string
+ *           enum: [STATIC_LIST]
+ *           description: Discriminator. Must be "STATIC_LIST".
+ *           example: "STATIC_LIST"
+ *         name:
+ *           type: string
+ *           minLength: 1
+ *           description: Display name for the dashboard filter key
+ *           example: "Environment"
+ *         options:
+ *           type: array
+ *           minItems: 1
+ *           maxItems: 1000
+ *           items:
+ *             type: string
+ *             minLength: 1
+ *             maxLength: 10000
+ *           description: |
+ *             The values this filter's dropdown offers. Must be non-empty and
+ *             free of duplicates.
+ *           example: ["prod", "staging", "dev"]
+ *         isBroadcastEnabled:
+ *           type: boolean
+ *           enum: [false]
+ *           default: false
+ *           description: |
+ *             Must be false — there is no expression to broadcast. Omit it and it
+ *             is false.
+ *           example: false
+ *         isVariableEnabled:
+ *           type: boolean
+ *           enum: [true]
+ *           default: true
+ *           description: |
+ *             Must be true if provided, and is true when omitted. Tiles reference
+ *             the selection as `$variableName`, or with the `$__filter(<expression>, $<variableName>)`
+ *             and `$__conditionalAll(<condition>, $<variableName>)` macros. The
+ *             one-argument `$__filter($<variableName>)` form renders the filter's
+ *             own expression, which this kind of filter does not have, so it
+ *             reports that the expression must be passed explicitly.
+ *           example: true
+ *         variableName:
+ *           type: string
+ *           maxLength: 64
+ *           pattern: '^[a-zA-Z][a-zA-Z0-9_]*$'
+ *           description: |
+ *             Token tiles reference this filter's selected value by, as
+ *             `$variableName`. Must start with a letter and may contain only
+ *             letters, numbers, and underscores. Defaults to the display name with
+ *             whitespace replaced by underscores and remaining illegal characters
+ *             removed, so a variable-enabled filter whose name derives nothing
+ *             usable must send this field explicitly. Variable names must be unique
+ *             across a dashboard's variable-enabled filters. Names the variable
+ *             only, so the field is rejected when isVariableEnabled is not true, and
+ *             is omitted from responses for such a filter.
+ *           example: "environment"
+ *         minSelections:
+ *           type: integer
+ *           enum: [0, 1]
+ *           default: 0
+ *           description: |
+ *             Minimum number of values that must be selected before tiles load.
+ *             Set to 1 to make the filter required. Only 0 and 1 are accepted.
+ *             Omit the field (or send 0) for the default optional behavior.
+ *           example: 1
+ *         isGlobalRequirement:
+ *           type: boolean
+ *           default: false
+ *           description: |
+ *             Widens a required filter's block to every tile on the dashboard. False
+ *             (the default) blocks only the tiles that read the filter: those
+ *             referencing its variableName, and those its broadcast applies to.
+ *             Ignored unless minSelections is 1.
+ *           example: true
+ *
+ *     PrometheusLabelFilterInput:
+ *       type: object
+ *       description: |
+ *         A filter whose dropdown lists the values for a Prometheus label,
+ *         read from a PromQL source over the dashboard's time range.
+ *         Supports variable mode only.
+ *       required:
+ *         - type
+ *         - name
+ *         - sourceId
+ *         - label
+ *       properties:
+ *         type:
+ *           type: string
+ *           enum: [PROMETHEUS_LABEL]
+ *           description: Discriminator. Must be "PROMETHEUS_LABEL".
+ *           example: "PROMETHEUS_LABEL"
+ *         name:
+ *           type: string
+ *           minLength: 1
+ *           description: Display name for the dashboard filter
+ *           example: "Pod"
+ *         sourceId:
+ *           type: string
+ *           description: |
+ *             Id of the PromQL source the label values are read from.
+ *           example: "65f5e4a3b9e77c001a123456"
+ *         label:
+ *           type: string
+ *           minLength: 1
+ *           maxLength: 1024
+ *           description: |
+ *             Label whose values populate the dropdown. Use "__name__" to list
+ *             metric names.
+ *           example: "pod"
+ *         match:
+ *           type: string
+ *           minLength: 1
+ *           description: |
+ *             Optional Prometheus series selector narrowing which series the
+ *             label values are read from.
+ *           example: 'up{job="api"}'
+ *         isBroadcastEnabled:
+ *           type: boolean
+ *           enum: [false]
+ *           default: false
+ *           description: Must be false or omitted.
+ *           example: false
+ *         isVariableEnabled:
+ *           type: boolean
+ *           enum: [true]
+ *           default: true
+ *           description: |
+ *             Must be true if provided, and is true when omitted. Tiles reference
+ *             the selection as `$variableName`.
+ *           example: true
+ *         variableName:
+ *           type: string
+ *           maxLength: 64
+ *           pattern: '^[a-zA-Z][a-zA-Z0-9_]*$'
+ *           description: |
+ *             Token that tiles reference this filter's selected value by, as
+ *             `$variableName`. Must start with a letter and may contain only
+ *             letters, numbers, and underscores. Defaults to the display name with
+ *             whitespace replaced by underscores and remaining illegal characters
+ *             removed. Variable names must be unique across a dashboard's
+ *             variable-enabled filters.
+ *           example: "pod"
+ *         minSelections:
+ *           type: integer
+ *           enum: [0, 1]
+ *           default: 0
+ *           description: |
+ *             Minimum number of values that must be selected before tiles load.
+ *             Set to 1 to make the filter required. Only 0 and 1 are accepted.
+ *             Omit the field (or send 0) for the default optional behavior.
+ *           example: 1
+ *         isGlobalRequirement:
+ *           type: boolean
+ *           default: false
+ *           description: |
+ *             Widens a required filter's block to every tile on the dashboard. False
+ *             (the default) blocks only the tiles that read the filter: those
+ *             referencing its variableName, and those its broadcast applies to.
+ *             Ignored unless minSelections is 1.
+ *           example: true
  *
  *     Filter:
  *       allOf:
@@ -1524,7 +2104,10 @@ const EXTERNAL_DASHBOARD_PROJECTION = {
  *           example: ["production", "monitoring"]
  *         filters:
  *           type: array
- *           description: Dashboard filter keys added to the dashboard and applied to all tiles
+ *           description: |
+ *             Dropdown filters added to the dashboard. Each one broadcasts
+ *             its selected value as a condition, acts as a variable which
+ *             can be referenced in tile queries, or both.
  *           items:
  *             $ref: '#/components/schemas/Filter'
  *         savedQuery:
@@ -1577,7 +2160,10 @@ const EXTERNAL_DASHBOARD_PROJECTION = {
  *           example: ["development"]
  *         filters:
  *           type: array
- *           description: Dashboard filter keys to add to the dashboard and apply across all tiles
+ *           description: |
+ *             Dropdown filters added to the dashboard. Each one broadcasts
+ *             its selected value as a condition, acts as a variable which
+ *             can be referenced in tile queries, or both.
  *           items:
  *             $ref: '#/components/schemas/FilterInput'
  *         savedQuery:
@@ -1630,7 +2216,10 @@ const EXTERNAL_DASHBOARD_PROJECTION = {
  *           example: ["production", "updated"]
  *         filters:
  *           type: array
- *           description: Dashboard filter keys on the dashboard, applied across all tiles
+ *           description: |
+ *             Dropdown filters added to the dashboard. Each one broadcasts
+ *             its selected value as a condition, acts as a variable which
+ *             can be referenced in tile queries, or both.
  *           items:
  *             $ref: '#/components/schemas/Filter'
  *         savedQuery:
@@ -1884,6 +2473,127 @@ router.get(
 
 /**
  * @openapi
+ * /api/v2/dashboards/validate:
+ *   post:
+ *     summary: Validate Dashboard
+ *     description: |
+ *       Validates a dashboard body against the same schema and tile rules used
+ *       by POST /api/v2/dashboards. The dashboard is **never persisted**. Use
+ *       this endpoint at plan time (e.g. from a Terraform provider) to check
+ *       that a dashboard configuration is valid before applying it.
+ *     operationId: validateDashboard
+ *     tags: [Dashboards]
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             $ref: '#/components/schemas/CreateDashboardRequest'
+ *     responses:
+ *       '200':
+ *         description: |
+ *           Validation result. HTTP 200 is always returned for valid **and**
+ *           invalid bodies — a non-200 response means the request itself
+ *           failed (auth, server error, etc.).
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               required: [valid, errors, normalized]
+ *               properties:
+ *                 valid:
+ *                   type: boolean
+ *                   description: True when the body passes all validation rules.
+ *                 errors:
+ *                   type: array
+ *                   description: Validation errors. Empty when valid is true.
+ *                   items:
+ *                     type: object
+ *                     required: [path, message]
+ *                     properties:
+ *                       path:
+ *                         type: string
+ *                         description: Dot-separated field path, or empty string for top-level errors.
+ *                       message:
+ *                         type: string
+ *                         description: Human-readable error description.
+ *                 normalized:
+ *                   type: object
+ *                   nullable: true
+ *                   description: |
+ *                     The parsed dashboard body with defaults applied (no
+ *                     persistence, so no server-assigned tile IDs). Populated
+ *                     when valid is true, null when valid is false.
+ *             examples:
+ *               valid:
+ *                 summary: Valid dashboard body
+ *                 value:
+ *                   valid: true
+ *                   errors: []
+ *                   normalized:
+ *                     name: "My Dashboard"
+ *                     tiles: []
+ *               invalid:
+ *                 summary: Invalid dashboard body
+ *                 value:
+ *                   valid: false
+ *                   errors:
+ *                     - path: "name"
+ *                       message: "Required"
+ *                   normalized: null
+ *       '401':
+ *         description: Unauthorized
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ *             example:
+ *               message: "Unauthorized access. API key is missing or invalid."
+ */
+router.post('/validate', async (req, res, next) => {
+  try {
+    const teamId = req.user?.team;
+    if (teamId == null) {
+      return res.sendStatus(403);
+    }
+
+    const parsed = createDashboardBodySchema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.json({
+        valid: false,
+        errors: parsed.error.issues.map(i => ({
+          path: i.path.join('.'),
+          message: i.message,
+        })),
+        normalized: null,
+      });
+    }
+
+    const { tiles, filters, containers } = parsed.data;
+    // Cast: createDashboardBodySchema tiles have optional `id`; the validator
+    // only reads sourceId/config — the cast is safe for a no-persist call.
+    const validationError = await validateDashboardTiles({
+      teamId: teamId.toString(),
+      tiles: tiles as ExternalDashboardTileWithId[],
+      filters,
+      containers: containers ?? [],
+    });
+    if (validationError) {
+      return res.json({
+        valid: false,
+        errors: [{ path: '', message: validationError }],
+        normalized: null,
+      });
+    }
+
+    return res.json({ valid: true, errors: [], normalized: parsed.data });
+  } catch (e) {
+    next(e);
+  }
+});
+
+/**
+ * @openapi
  * /api/v2/dashboards:
  *   post:
  *     summary: Create Dashboard
@@ -1954,6 +2664,12 @@ router.get(
  *                     name: "Service"
  *                     expression: "service_name"
  *                     sourceId: "65f5e4a3b9e77c001a111111"
+ *                   - type: "STATIC_LIST"
+ *                     name: "Environment"
+ *                     options: ["prod", "staging", "dev"]
+ *                     isBroadcastEnabled: false
+ *                     isVariableEnabled: true
+ *                     variableName: "env"
  *     responses:
  *       '200':
  *         description: Successfully created dashboard
@@ -2065,6 +2781,8 @@ router.post(
         team: teamId,
         ...(containers !== undefined ? { containers } : {}),
       }).save();
+
+      recordDashboardOnboardingIfHasTiles(req.user?._id, newDashboard.tiles);
 
       res.json({
         data: convertToExternalDashboard(newDashboard),
@@ -2331,6 +3049,11 @@ router.put(
         internalTiles,
         existingTileIds,
       });
+
+      recordDashboardOnboardingIfHasTiles(
+        req.user?._id,
+        updatedDashboard.tiles,
+      );
 
       res.json({
         data: convertToExternalDashboard(updatedDashboard),

@@ -1,5 +1,4 @@
 import { type AlertInterval } from '@hyperdx/common-utils/dist/types';
-import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { ObjectId } from 'mongodb';
 import mongoose from 'mongoose';
 import { z } from 'zod';
@@ -7,59 +6,33 @@ import { z } from 'zod';
 import * as config from '@/config';
 import { getRecentAlertHistories } from '@/controllers/alertHistory';
 import { getAlertById } from '@/controllers/alerts';
+import type { ToolRegistrar } from '@/mcp/tools/types';
+import { mcpUserError, validateObjectId } from '@/mcp/utils/errors';
 import Alert from '@/models/alert';
 import type { IDashboard } from '@/models/dashboard';
 import type { ISavedSearch } from '@/models/savedSearch';
-import { translateAlertDocumentToExternalAlert } from '@/utils/externalApi';
+import { translateAlertDocumentToExternalAlertWithChartConfig } from '@/routers/external-api/v2/utils/alertChartConfig';
+import { resolveAlertDisplayFields } from '@/utils/alerts';
 
-import { validateObjectId } from '../../utils/errors';
-import { withToolTracing } from '../../utils/tracing';
-import type { McpContext } from '../types';
-
-function deriveAlertName(alert: {
-  name?: string | null;
-  tileId?: string;
-  savedSearch?: ISavedSearch | null;
-  dashboard?: IDashboard | null;
-}): string | null {
-  // Prefer explicit alert name
-  if (alert.name) {
-    return alert.name;
-  }
-
-  // Fall back to saved search name
-  if (alert.savedSearch?.name) {
-    return alert.savedSearch.name;
-  }
-
-  // Fall back to dashboard tile name or dashboard name
-  if (alert.dashboard?.name) {
-    if (alert.tileId) {
-      const tile = alert.dashboard.tiles?.find(t => t.id === alert.tileId);
-      if (tile?.config?.name) {
-        return tile.config.name;
-      }
-    }
-    return alert.dashboard.name;
-  }
-
-  return null;
-}
-
-export function registerGetAlert(server: McpServer, context: McpContext): void {
+export function registerGetAlert({
+  context,
+  registerTool,
+}: ToolRegistrar): void {
   const { teamId } = context;
   const frontendUrl = config.FRONTEND_URL;
 
-  server.registerTool(
+  registerTool(
     'clickstack_get_alert',
     {
       title: 'Get Alert(s)',
+      annotations: { readOnlyHint: true },
       description:
         'Without an ID: list all alerts as a high-level summary ' +
-        '(id, name, state, source, interval). Optionally filter by state ' +
+        '(id, name, displayName, tags, state, source, interval). Optionally ' +
+        'filter by state ' +
         '(e.g. state="ALERT" for firing alerts). ' +
-        'With an ID: get full alert detail including configuration and ' +
-        'recent evaluation history.',
+        'With an ID: get full alert detail including configuration, ' +
+        'displayName, tags, and recent evaluation history.',
       inputSchema: z.object({
         id: z
           .string()
@@ -76,7 +49,7 @@ export function registerGetAlert(server: McpServer, context: McpContext): void {
           ),
       }),
     },
-    withToolTracing('clickstack_get_alert', context, async ({ id, state }) => {
+    async ({ id, state }) => {
       // ── List all alerts (slim summary) ──
       if (!id) {
         const query: Record<string, unknown> = {
@@ -91,10 +64,15 @@ export function registerGetAlert(server: McpServer, context: McpContext): void {
         }>(['savedSearch', 'dashboard']);
 
         const output = alerts.map(alert => {
-          const name = deriveAlertName(alert);
+          const { displayName, tags } = resolveAlertDisplayFields(alert, {
+            savedSearch: alert.savedSearch,
+            dashboard: alert.dashboard,
+          });
           return {
             id: alert._id.toString(),
-            name,
+            name: alert.name,
+            displayName,
+            tags,
             state: alert.state,
             source: alert.source,
             interval: alert.interval,
@@ -114,20 +92,18 @@ export function registerGetAlert(server: McpServer, context: McpContext): void {
 
       const alert = await getAlertById(id, teamId);
       if (!alert) {
-        return {
-          isError: true,
-          content: [{ type: 'text' as const, text: 'Alert not found' }],
-        };
+        return mcpUserError('Alert not found');
       }
 
-      const external = translateAlertDocumentToExternalAlert(alert);
-
-      // Populate refs so deriveAlertName can fall back to the
-      // saved search / dashboard name when the alert has no explicit name.
+      // Populate the refs the display name/tags derive from, so alerts written
+      // before those fields existed still resolve to something meaningful.
       const populated = await alert.populate<{
         savedSearch: ISavedSearch | null;
         dashboard: IDashboard | null;
       }>(['savedSearch', 'dashboard']);
+
+      const external =
+        translateAlertDocumentToExternalAlertWithChartConfig(populated);
 
       const history = await getRecentAlertHistories({
         alertId: new ObjectId(alert._id),
@@ -142,7 +118,6 @@ export function registerGetAlert(server: McpServer, context: McpContext): void {
             text: JSON.stringify(
               {
                 ...external,
-                name: deriveAlertName(populated) ?? external.name,
                 history,
                 ...(frontendUrl ? { url: `${frontendUrl}/alerts` } : {}),
               },
@@ -152,6 +127,6 @@ export function registerGetAlert(server: McpServer, context: McpContext): void {
           },
         ],
       };
-    }),
+    },
   );
 }

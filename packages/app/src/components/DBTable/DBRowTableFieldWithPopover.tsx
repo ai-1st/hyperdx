@@ -1,20 +1,19 @@
-import React, { useContext, useEffect, useRef, useState } from 'react';
+import React, { use, useEffect, useRef, useState } from 'react';
 import cx from 'classnames';
 import { Popover } from '@mantine/core';
 import { useDisclosure } from '@mantine/hooks';
 import { notifications } from '@mantine/notifications';
 import { IconCopy, IconFilter, IconFilterX } from '@tabler/icons-react';
 
+import { RowSidePanelContext } from '@/components/DBRowSidePanel';
 import {
   CLIPBOARD_ERROR_MESSAGE,
   copyTextToClipboard,
 } from '@/utils/clipboard';
 
-import { RowSidePanelContext } from '../DBRowSidePanel';
-
 import { DBRowTableIconButton } from './DBRowTableIconButton';
 
-import styles from '../../../styles/LogTable.module.scss';
+import styles from '@styles/LogTable.module.scss';
 
 interface DBRowTableFieldWithPopoverProps {
   children: React.ReactNode;
@@ -52,7 +51,7 @@ const DBRowTableFieldWithPopover = ({
   }, []);
 
   // Get filter functionality from context
-  const { onPropertyAddClick } = useContext(RowSidePanelContext);
+  const { onPropertyAddClick } = use(RowSidePanelContext);
 
   // Check if we have both the column name and filter function available
   const canFilter = columnName && onPropertyAddClick && cellValue != null;

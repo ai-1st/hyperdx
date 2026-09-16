@@ -1,5 +1,9 @@
 import { SearchPage } from '../../page-objects/SearchPage';
 import { expect, test } from '../../utils/base-test';
+import {
+  expectFieldSuggestion,
+  switchWhereToLucene,
+} from '../../utils/lucene-autocomplete';
 
 test.describe('Search', { tag: '@search' }, () => {
   let searchPage: SearchPage;
@@ -53,13 +57,33 @@ test.describe('Search', { tag: '@search' }, () => {
       });
 
       await test.step('Navigate through all side panel tabs', async () => {
-        const tabs = ['parsed', 'trace', 'context', 'overview'];
+        const tabs = ['parsed', 'context', 'overview'];
 
         // Use side panel component to navigate tabs
         for (const tabName of tabs) {
           await searchPage.sidePanel.clickTab(tabName);
           await expect(searchPage.sidePanel.getTab(tabName)).toBeVisible();
         }
+      });
+
+      await test.step("Lucene autocomplete works in Surrounding Context's custom filter", async () => {
+        await searchPage.sidePanel.clickTab('context');
+        await searchPage.sidePanel.setContextBy('Custom');
+
+        const whereInput = searchPage.sidePanel.contextTab.getByPlaceholder(
+          'Search your events w/ Lucene ex. column:foo',
+        );
+        await switchWhereToLucene(
+          searchPage.sidePanel.contextTab.getByTestId('where-language-switch'),
+        );
+
+        // This input's date range is the narrow window around the selected row,
+        // so it only ever suggested anything once it was given both that range
+        // and the source id.
+        await expectFieldSuggestion(whereInput, {
+          prefix: 'Servi',
+          field: 'ServiceName',
+        });
       });
     });
   });
@@ -104,7 +128,11 @@ test.describe('Search', { tag: '@search' }, () => {
       });
 
       await test.step('Navigate through all side panel tabs', async () => {
-        const tabs = ['trace', 'context', 'infrastructure', 'overview'];
+        // Logs sources no longer render a Trace tab (it's gated behind
+        // source.kind === Trace). For a Kubernetes log row the available tabs
+        // are Surrounding Context (always present), Infrastructure (k8s
+        // context) and Overview.
+        const tabs = ['context', 'infrastructure', 'overview'];
 
         // Use side panel component with proper waiting
         for (const tabName of tabs) {
@@ -154,10 +182,10 @@ test.describe('Search', { tag: '@search' }, () => {
       });
 
       await test.step('Infrastructure tab is not offered', async () => {
-        // The tab bar rendered (an always-present tab is visible), but the gate
-        // omits Infrastructure because the row carries no k8s correlation
-        // attributes.
-        await expect(searchPage.sidePanel.getTab('trace')).toBeVisible();
+        // The tab bar rendered (the always-present Column Values tab is
+        // visible), but the gate omits Infrastructure because the row carries
+        // no k8s correlation attributes.
+        await expect(searchPage.sidePanel.getTab('parsed')).toBeVisible();
         await expect(searchPage.sidePanel.getTab('infrastructure')).toHaveCount(
           0,
         );

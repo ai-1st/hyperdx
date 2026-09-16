@@ -38,7 +38,8 @@ import { PageLayout } from '@/components/PageLayout';
 import { TimePicker } from '@/components/TimePicker';
 import { withAppNav } from '@/layout';
 
-import { ChartBox } from './components/ChartBox';
+import { ChartCard } from './components/charts/ChartCard';
+import ChartContainer from './components/charts/ChartContainer';
 import DBHeatmapChart from './components/DBHeatmapChart';
 import { DBSqlRowTable } from './components/DBRowTable';
 import DBTableChart from './components/DBTableChart';
@@ -47,11 +48,8 @@ import { useDashboardRefresh } from './hooks/useDashboardRefresh';
 import { useBrandDisplayName } from './theme/ThemeProvider';
 import { clickhouseSql } from './utils/codeMirror';
 import { useConnections } from './connection';
-import { parseTimeQuery, useNewTimeQuery } from './timeQuery';
+import { useDefaultTimeRange, useNewTimeQuery } from './timeQuery';
 import { usePrevious } from './utils';
-
-// TODO: This is a hack to set the default time range
-const defaultTimeRange = parseTimeQuery('Past 1h', false) as [Date, Date];
 
 const from = {
   databaseName: 'system',
@@ -70,7 +68,7 @@ function InfrastructureTab({
   return (
     <Grid mt="md">
       <Grid.Col span={6}>
-        <ChartBox style={{ height: 400 }}>
+        <ChartCard style={{ height: 400 }}>
           <DBTimeChart
             title="CPU Usage (Cores)"
             config={{
@@ -93,10 +91,10 @@ function InfrastructureTab({
             }}
             onTimeRangeSelect={onTimeRangeSelect}
           />
-        </ChartBox>
+        </ChartCard>
       </Grid.Col>
       <Grid.Col span={6}>
-        <ChartBox style={{ height: 400 }}>
+        <ChartCard style={{ height: 400 }}>
           <DBTimeChart
             title="Memory Usage"
             config={{
@@ -122,10 +120,10 @@ function InfrastructureTab({
             }}
             onTimeRangeSelect={onTimeRangeSelect}
           />
-        </ChartBox>
+        </ChartCard>
       </Grid.Col>
       <Grid.Col span={6}>
-        <ChartBox style={{ height: 400 }}>
+        <ChartCard style={{ height: 400 }}>
           <DBTimeChart
             title="Disk"
             config={{
@@ -159,10 +157,10 @@ function InfrastructureTab({
             }}
             onTimeRangeSelect={onTimeRangeSelect}
           />
-        </ChartBox>
+        </ChartCard>
       </Grid.Col>
       <Grid.Col span={6}>
-        <ChartBox style={{ height: 400 }}>
+        <ChartCard style={{ height: 400 }}>
           <DBTimeChart
             title="S3 Requests"
             config={{
@@ -210,10 +208,10 @@ function InfrastructureTab({
             }}
             onTimeRangeSelect={onTimeRangeSelect}
           />
-        </ChartBox>
+        </ChartCard>
       </Grid.Col>
       <Grid.Col span={6}>
-        <ChartBox style={{ height: 400 }}>
+        <ChartCard style={{ height: 400 }}>
           <DBTimeChart
             title={
               <Stack gap={0}>
@@ -250,7 +248,7 @@ function InfrastructureTab({
             }}
             onTimeRangeSelect={onTimeRangeSelect}
           />
-        </ChartBox>
+        </ChartCard>
       </Grid.Col>
     </Grid>
   );
@@ -355,7 +353,7 @@ function InsertsTab({
   return (
     <Grid mt="md">
       <Grid.Col span={12}>
-        <ChartBox style={{ height: 400 }}>
+        <ChartCard style={{ height: 400 }}>
           <DBTimeChart
             title={
               <Text size="sm">
@@ -374,7 +372,6 @@ function InsertsTab({
                 size="xs"
                 value={insertsBy ?? 'queries'}
                 onChange={value => {
-                  // @ts-ignore
                   setInsertsBy(value);
                 }}
                 data={[
@@ -387,10 +384,10 @@ function InsertsTab({
             config={insertsPerTableConfig}
             onTimeRangeSelect={onTimeRangeSelect}
           />
-        </ChartBox>
+        </ChartCard>
       </Grid.Col>
       <Grid.Col span={12}>
-        <ChartBox style={{ height: 200 }}>
+        <ChartCard style={{ height: 200 }}>
           <DBTimeChart
             title="Max Active Parts per Partition"
             config={{
@@ -416,10 +413,10 @@ function InsertsTab({
             showLegend={false}
             onTimeRangeSelect={onTimeRangeSelect}
           />
-        </ChartBox>
+        </ChartCard>
       </Grid.Col>
       <Grid.Col span={12}>
-        <ChartBox style={{ height: 400 }}>
+        <ChartCard style={{ height: 400 }}>
           <DBTableChart
             title={
               <Stack gap={0}>
@@ -484,13 +481,16 @@ function InsertsTab({
               selectGroupBy: false,
             }}
           />
-        </ChartBox>
+        </ChartCard>
       </Grid.Col>
     </Grid>
   );
 }
 
+const DEFAULT_INTERVAL = 'Past 1h';
+
 function ClickhousePage() {
+  const defaultTimeRange = useDefaultTimeRange(DEFAULT_INTERVAL);
   const brandName = useBrandDisplayName();
   const { colorScheme } = useMantineColorScheme();
   const { data: connections } = useConnections();
@@ -522,7 +522,6 @@ function ClickhousePage() {
       setConnection(watchedConnection ?? null);
     }
   }, [watchedConnection, setConnection, previousWatchedConnection]);
-  const DEFAULT_INTERVAL = 'Past 1h';
   const [displayedTimeInputValue, setDisplayedTimeInputValue] =
     useState(DEFAULT_INTERVAL);
 
@@ -652,7 +651,7 @@ function ClickhousePage() {
             mt="md"
             keepMounted={false}
             defaultValue="selects"
-            // @ts-ignore
+            // @ts-expect-error Mantine Tabs onChange passes string | null; setter expects a narrowed union
             onChange={setTab}
             value={tab}
           >
@@ -665,7 +664,7 @@ function ClickhousePage() {
             <Tabs.Panel value="selects">
               <Grid mt="md">
                 <Grid.Col span={12}>
-                  <ChartBox style={{ height: 250 }}>
+                  <ChartCard style={{ height: 250 }}>
                     <DBHeatmapChart
                       title="Query Latency"
                       toolbarSuffix={heatmapToolbarItems}
@@ -698,10 +697,10 @@ function ClickhousePage() {
                         });
                       }}
                     />
-                  </ChartBox>
+                  </ChartCard>
                 </Grid.Col>
                 <Grid.Col span={12}>
-                  <ChartBox style={{ height: 400 }}>
+                  <ChartCard style={{ height: 400 }}>
                     <DBTimeChart
                       title="Query Count by Table"
                       config={{
@@ -737,10 +736,10 @@ function ClickhousePage() {
                         onTimeRangeSelect(start, end);
                       }}
                     />
-                  </ChartBox>
+                  </ChartCard>
                 </Grid.Col>
                 <Grid.Col span={12}>
-                  <ChartBox style={{ height: 400 }}>
+                  <ChartCard style={{ height: 400 }}>
                     <DBTableChart
                       title="Most Time Consuming Query Patterns"
                       config={{
@@ -793,63 +792,57 @@ function ClickhousePage() {
                         limit: { limit: 20 },
                       }}
                     />
-                  </ChartBox>
+                  </ChartCard>
                 </Grid.Col>
                 <Grid.Col span={12}>
-                  <ChartBox
-                    style={{
-                      height: 400,
-                      overflow: 'hidden',
-                    }}
-                  >
-                    <Text size="sm" mb="md">
-                      Slowest Queries
-                    </Text>
-                    <DBSqlRowTable
-                      renderRowDetails={row => {
-                        return (
-                          <ReactCodeMirror
-                            extensions={[clickhouseSql()]}
-                            editable={false}
-                            value={formatSql(row.query)}
-                            theme={colorScheme === 'dark' ? 'dark' : 'light'}
-                            lang="sql"
-                            maxHeight="200px"
-                          />
-                        );
-                      }}
-                      config={{
-                        select: `event_time, query_kind, 
+                  <ChartCard style={{ height: 400 }}>
+                    <ChartContainer title="Slowest Queries">
+                      <DBSqlRowTable
+                        renderRowDetails={row => {
+                          return (
+                            <ReactCodeMirror
+                              extensions={[clickhouseSql()]}
+                              editable={false}
+                              value={formatSql(String(row.query ?? ''))}
+                              theme={colorScheme === 'dark' ? 'dark' : 'light'}
+                              lang="sql"
+                              maxHeight="200px"
+                            />
+                          );
+                        }}
+                        config={{
+                          select: `event_time, query_kind, 
                 read_rows,
                 formatReadableSize(memory_usage) as memory_usage,
                 query_duration_ms, 
                 query`,
-                        dateRange: searchedTimeRange,
-                        from,
-                        where: `(
+                          dateRange: searchedTimeRange,
+                          from,
+                          where: `(
                   type='ExceptionWhileProcessing' OR type='QueryFinish' 
                 )`,
-                        timestampValueExpression: 'event_time',
-                        connection,
-                        orderBy: [
-                          {
-                            valueExpression: 'query_duration_ms',
-                            ordering: 'DESC',
-                          },
-                        ],
-                        filters: [
-                          ...filters,
-                          {
-                            type: 'sql_ast',
-                            operator: '=',
-                            left: 'query_kind',
-                            right: `'Select'`,
-                          },
-                        ],
-                        limit: { limit: 100 },
-                      }}
-                    />
-                  </ChartBox>
+                          timestampValueExpression: 'event_time',
+                          connection,
+                          orderBy: [
+                            {
+                              valueExpression: 'query_duration_ms',
+                              ordering: 'DESC',
+                            },
+                          ],
+                          filters: [
+                            ...filters,
+                            {
+                              type: 'sql_ast',
+                              operator: '=',
+                              left: 'query_kind',
+                              right: `'Select'`,
+                            },
+                          ],
+                          limit: { limit: 100 },
+                        }}
+                      />
+                    </ChartContainer>
+                  </ChartCard>
                 </Grid.Col>
               </Grid>
             </Tabs.Panel>
@@ -877,7 +870,7 @@ const ClickhousePageDynamic = dynamic(async () => ClickhousePage, {
   ssr: false,
 });
 
-// @ts-ignore
+// @ts-expect-error next/dynamic component type does not include the getLayout static
 ClickhousePageDynamic.getLayout = withAppNav;
 
 export default ClickhousePageDynamic;

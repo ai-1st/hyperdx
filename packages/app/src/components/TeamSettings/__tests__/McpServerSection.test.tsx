@@ -4,8 +4,7 @@ import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 
 import api from '@/api';
-
-import McpServerSection from '../McpServerSection';
+import McpServerSection from '@/components/TeamSettings/McpServerSection';
 
 jest.mock('@/api', () => ({
   __esModule: true,
@@ -115,7 +114,11 @@ describe('McpServerSection', () => {
 
     await user.click(screen.getByText('Codex CLI'));
 
-    expect(screen.getByText(/codex mcp add clickstack /)).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        /codex mcp add clickstack --url .*--bearer-token-env-var/s,
+      ),
+    ).toBeInTheDocument();
     expect(
       screen.queryByText(/^claude mcp add clickstack /),
     ).not.toBeInTheDocument();

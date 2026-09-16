@@ -1,8 +1,9 @@
-import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 
-import { withToolTracing } from '../../utils/tracing';
-import type { McpContext } from '../types';
+import type { ToolRegistrar } from '@/mcp/tools/types';
+import { mcpUserError } from '@/mcp/utils/errors';
+
+import { PREFER_BUILDER_OVER_SQL_NUDGE } from './builderCatalog';
 import { parseTimeRange } from './helpers';
 import { runEventPatterns } from './runEventPatterns';
 import {
@@ -62,13 +63,17 @@ const eventPatternsSchema = z.object({
 
 // ─── Tool registration ───────────────────────────────────────────────────────
 
-export function registerEventPatterns(server: McpServer, context: McpContext) {
+export function registerEventPatterns({
+  context,
+  registerTool,
+}: ToolRegistrar) {
   const { teamId } = context;
 
-  server.registerTool(
+  registerTool(
     'clickstack_event_patterns',
     {
       title: 'Event Pattern Mining',
+      annotations: { readOnlyHint: true },
       description:
         'Discover the most common log messages and event patterns. ' +
         'Samples random events, clusters them using the Drain algorithm, and returns ' +
@@ -82,19 +87,18 @@ export function registerEventPatterns(server: McpServer, context: McpContext) {
         'Each pattern includes a "whereSnippet" — use it as the "where" parameter in ' +
         'a follow-up clickstack_search call to browse matching raw events.\n\n' +
         'Requires sourceId — call clickstack_list_sources then clickstack_describe_source first.\n\n' +
+        PREFER_BUILDER_OVER_SQL_NUDGE +
+        '\n\n' +
         'When to use which tool:\n' +
         '  - clickstack_event_patterns: clustering / recurring shapes / noise analysis\n' +
         '  - clickstack_search: raw individual rows\n' +
         '  - clickstack_table: aggregated metrics / counts / top-N',
       inputSchema: eventPatternsSchema,
     },
-    withToolTracing('clickstack_event_patterns', context, async input => {
+    async input => {
       const timeRange = parseTimeRange(input.startTime, input.endTime);
       if ('error' in timeRange) {
-        return {
-          isError: true,
-          content: [{ type: 'text' as const, text: timeRange.error }],
-        };
+        return mcpUserError(timeRange.error);
       }
       const { startDate, endDate } = timeRange;
 
@@ -112,6 +116,6 @@ export function registerEventPatterns(server: McpServer, context: McpContext) {
           trendBuckets: input.trendBuckets,
         },
       );
-    }),
+    },
   );
 }

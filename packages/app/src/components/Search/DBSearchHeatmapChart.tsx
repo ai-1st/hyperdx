@@ -15,12 +15,8 @@ import {
 import { useDisclosure } from '@mantine/hooks';
 import { IconSettings } from '@tabler/icons-react';
 
-import HeatmapSettingsDrawer from '@/components/HeatmapSettingsDrawer';
-import { getDurationMsExpression } from '@/source';
-import type { NumberFormat } from '@/types';
-
-import type { AddFilterFn } from '../DBDeltaChart';
-import DBDeltaChart from '../DBDeltaChart';
+import type { AddFilterFn } from '@/components/DBDeltaChart';
+import DBDeltaChart from '@/components/DBDeltaChart';
 import DBHeatmapChart, {
   ColorLegend,
   darkPalette,
@@ -28,18 +24,27 @@ import DBHeatmapChart, {
   lightPalette,
   type SelectionBounds,
   toHeatmapChartConfig,
-} from '../DBHeatmapChart';
+} from '@/components/DBHeatmapChart';
+import HeatmapSettingsDrawer from '@/components/HeatmapSettingsDrawer';
+import { getDurationMsExpression } from '@/source';
+import type { NumberFormat } from '@/types';
 
 export function DBSearchHeatmapChart({
   chartConfig,
   source,
   isReady,
   onAddFilter,
+  isPriorityProperty,
+  deltaSelectExpression,
 }: {
   chartConfig: BuilderChartConfigWithDateRange;
   source: TTraceSource;
   isReady: boolean;
   onAddFilter?: AddFilterFn;
+  /** Pin matching properties to the top of the delta breakdown. */
+  isPriorityProperty?: (flattenedKey: string) => boolean;
+  /** Select list for the delta sampling queries (defaults to '*'). */
+  deltaSelectExpression?: string;
 }) {
   const [fields, setFields] = useQueryStates({
     value: parseAsString.withDefault(getDurationMsExpression(source)),
@@ -218,6 +223,8 @@ export function DBSearchHeatmapChart({
           }
           spanIdExpression={source.spanIdExpression}
           legendPrefix={<ColorLegend colors={palette} />}
+          isPriorityProperty={isPriorityProperty}
+          selectExpression={deltaSelectExpression}
         />
       </Box>
     </Flex>

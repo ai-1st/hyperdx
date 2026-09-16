@@ -6,11 +6,13 @@ import { expect, Locator, Page } from '@playwright/test';
 
 import { FilterComponent } from '../components/FilterComponent';
 import { InfrastructurePanelComponent } from '../components/InfrastructurePanelComponent';
+import { PatternSidePanelComponent } from '../components/PatternSidePanelComponent';
 import { SavedSearchModalComponent } from '../components/SavedSearchModalComponent';
 import { SearchPageAlertModalComponent } from '../components/SearchPageAlertModalComponent';
 import { SidePanelComponent } from '../components/SidePanelComponent';
 import { TableComponent } from '../components/TableComponent';
 import { TimePickerComponent } from '../components/TimePickerComponent';
+import { dismissSqlAutocomplete } from '../utils/locators';
 
 type SaveSearchModalProps = {
   update: boolean;
@@ -20,6 +22,7 @@ export class SearchPage {
   readonly table: TableComponent;
   readonly timePicker: TimePickerComponent;
   readonly sidePanel: SidePanelComponent;
+  readonly patternSidePanel: PatternSidePanelComponent;
   readonly infrastructure: InfrastructurePanelComponent;
   readonly filters: FilterComponent;
   readonly savedSearchModal: SavedSearchModalComponent;
@@ -49,6 +52,7 @@ export class SearchPage {
     );
     this.timePicker = new TimePickerComponent(page);
     this.sidePanel = new SidePanelComponent(page, 'row-side-panel');
+    this.patternSidePanel = new PatternSidePanelComponent(page);
     this.infrastructure = new InfrastructurePanelComponent(page);
     this.filters = new FilterComponent(page);
     this.savedSearchModal = new SavedSearchModalComponent(page);
@@ -109,6 +113,56 @@ export class SearchPage {
       .click();
   }
 
+  /** The "Event Patterns" analysis-mode tab in the filters sidebar. */
+  get eventPatternsTab() {
+    return this.page.getByRole('tab', { name: 'Event Patterns' });
+  }
+
+  /**
+   * The pattern list table (the "Event Patterns" grid). It renders before the
+   * flyout in the DOM (the flyout is a portaled drawer), so `.first()` resolves
+   * the pattern list even after the flyout's sample table mounts.
+   */
+  get patternListTable() {
+    return this.page.getByTestId('search-results-table').first();
+  }
+
+  get patternListRows() {
+    return this.patternListTable.locator('[data-testid^="table-row-"]');
+  }
+
+  /**
+   * Switch to Event Patterns mode and wait for the (client-side, Drain-based)
+   * pattern list to finish clustering and render at least one pattern row.
+   */
+  async switchToEventPatterns(timeout = 60_000) {
+    await this.eventPatternsTab.click();
+    await this.patternListRows.first().waitFor({ state: 'visible', timeout });
+  }
+
+  /**
+   * The Level-column cell of a pattern-list row. The list renders its columns
+   * as sibling divs inside the row's content button (see PatternTable's
+   * displayedColumns: Trend, Count, Level, Pattern).
+   */
+  patternListLevelCell(rowIndex = 0) {
+    const PATTERN_LIST_LEVEL_COLUMN_INDEX = 2;
+    return this.patternListRows
+      .nth(rowIndex)
+      .locator('td > button > div')
+      .nth(PATTERN_LIST_LEVEL_COLUMN_INDEX);
+  }
+
+  /** Open the first pattern's sample flyout and wait for it to render. */
+  async openFirstPattern(timeout = 30_000) {
+    await this.patternListRows.first().click();
+    await this.patternSidePanel.container.waitFor({
+      state: 'visible',
+      timeout,
+    });
+    await this.patternSidePanel.firstRow.waitFor({ state: 'visible', timeout });
+  }
+
   async openEditSourceModal() {
     await this.sourceActionsMenu.click();
     await this.editSourceItem.click();
@@ -123,6 +177,10 @@ export class SearchPage {
     }
   }
 
+  async saveSourceForm() {
+    await this.page.getByRole('button', { name: 'Save Source' }).click();
+  }
+
   /**
    * Perform a search with the given query
    */
@@ -133,6 +191,18 @@ export class SearchPage {
     await this.page.waitForLoadState('networkidle');
     // Wait for new results to populate
     await this.table.waitForRowsToPopulate();
+  }
+
+  /**
+   * Open a log row that carries trace context (a non-empty TraceId) so the side
+   * panel renders the cross-source "View Trace" action.
+   */
+  async openTraceLinkedLogRow(traceId: string = 'trace-0') {
+    await this.timePicker.selectRelativeTime('Last 1 days');
+    await this.performSearch(`TraceId:"${traceId}"`);
+    await expect(this.table.firstRow).toBeVisible();
+    await this.table.clickFirstRow();
+    await expect(this.sidePanel.tabs).toBeVisible();
   }
 
   /**
@@ -234,6 +304,15 @@ export class SearchPage {
   }
 
   /**
+   * Locator for the results table's error state (rendered by ChartErrorState
+   * when the underlying ClickHouse query fails). Assert `toHaveCount(0)` to
+   * confirm the results loaded without error.
+   */
+  getTableError() {
+    return this.page.getByText(/Error loading/i);
+  }
+
+  /**
    * Get SELECT editor (CodeMirror)
    */
   getSELECTEditor() {
@@ -253,7 +332,13 @@ export class SearchPage {
   async setCustomSELECT(selectStatement: string) {
     const selectEditor = this.getSELECTEditor();
     await selectEditor.click({ clickCount: 3 }); // Select all
-    await this.page.keyboard.type(selectStatement);
+    // Insert atomically rather than per-keystroke: under load CodeMirror can
+    // drop individual keys from keyboard.type (e.g. "Timestamp" -> "Timstamp"),
+    // which then gets faithfully saved and fails later assertions.
+    await this.page.keyboard.insertText(selectStatement);
+    // Dismiss the autocomplete popup so it can't linger and overlay the next
+    // control (e.g. the Save Search button).
+    await dismissSqlAutocomplete(this.page);
   }
 
   /**
