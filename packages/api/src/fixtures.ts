@@ -336,15 +336,11 @@ export const seedTimeSeriesTagsTable = async ({
       .join(', ')})`;
 
   const columns = storeTimeBounds
-    ? '(metric_name, tags, all_tags, min_time, max_time)'
-    : '(metric_name, tags, all_tags)';
+    ? '(metric_name, tags, min_time, max_time)'
+    : '(metric_name, tags)';
   const values = series
     .map(s => {
-      const row = [
-        quoted(s.metricName),
-        mapLiteral(s.tags),
-        mapLiteral({ __name__: s.metricName, ...s.tags }),
-      ];
+      const row = [quoted(s.metricName), mapLiteral(s.tags)];
       if (storeTimeBounds) {
         row.push(
           `toDateTime64(${s.startSec}, 3)`,
@@ -453,17 +449,19 @@ export const bulkInsertLogs = async (
 // the on-disk row is byte-identical to today's behaviour. New tests that need
 // to exercise the cross-scope attribute hashing (see HDX-4466) can opt in by
 // passing one or both maps explicitly.
-export const bulkInsertMetricsGauge = async (
-  metrics: {
-    MetricName: string;
-    ResourceAttributes: Record<string, string>;
-    ScopeAttributes?: Record<string, string>;
-    Attributes?: Record<string, string>;
-    ServiceName: string;
-    TimeUnix: Date;
-    Value: number;
-  }[],
-) => {
+type NumberMetricPoint = {
+  MetricName: string;
+  MetricUnit?: string;
+  MetricDescription?: string;
+  ResourceAttributes: Record<string, string>;
+  ScopeAttributes?: Record<string, string>;
+  Attributes?: Record<string, string>;
+  ServiceName: string;
+  TimeUnix: Date;
+  Value: number;
+};
+
+export const bulkInsertMetricsGauge = async (metrics: NumberMetricPoint[]) => {
   if (!config.IS_CI) {
     throw new Error('ONLY execute this in CI env 😈 !!!');
   }
@@ -474,17 +472,10 @@ export const bulkInsertMetricsGauge = async (
 };
 
 export const bulkInsertMetricsSum = async (
-  metrics: {
+  metrics: (NumberMetricPoint & {
     AggregationTemporality: number;
     IsMonotonic: boolean;
-    MetricName: string;
-    ResourceAttributes: Record<string, string>;
-    ScopeAttributes?: Record<string, string>;
-    Attributes?: Record<string, string>;
-    ServiceName: string;
-    TimeUnix: Date;
-    Value: number;
-  }[],
+  })[],
 ) => {
   if (!config.IS_CI) {
     throw new Error('ONLY execute this in CI env 😈 !!!');

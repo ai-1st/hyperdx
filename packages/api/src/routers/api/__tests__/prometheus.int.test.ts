@@ -1,3 +1,9 @@
+import {
+  buildLogComment,
+  QUERY_ATTRIBUTION_HEADER,
+} from '@hyperdx/common-utils/dist/clickhouse';
+import { Metadata } from '@hyperdx/common-utils/dist/core/metadata';
+import { SourceKind } from '@hyperdx/common-utils/dist/types';
 import { Types } from 'mongoose';
 
 import * as config from '@/config';
@@ -10,9 +16,19 @@ import {
   seedTimeSeriesTagsTable,
 } from '@/fixtures';
 import Connection from '@/models/connection';
-import { PROMETHEUS_MAX_EXEMPLAR_WINDOW_SEC } from '@/routers/api/prometheus';
+import { Source } from '@/models/source';
+import {
+  CLICKHOUSE_PROMETHEUS_API_PREFIX,
+  clickhousePrometheusUpstream,
+  joinPrometheusUpstreamUrl,
+  PROMETHEUS_MAX_EXEMPLAR_WINDOW_SEC,
+} from '@/routers/api/prometheus';
 
 const mockFetch = jest.mocked(global.fetch);
+
+// Set by jest.setup.ts before it stubs `fetch`, for tests that must reach a
+// live service.
+const { realFetch } = globalThis as unknown as { realFetch: typeof fetch };
 
 const matchQueryString = (selectors: string[]) =>
   selectors.map(s => `match[]=${encodeURIComponent(s)}`).join('&');
@@ -43,6 +59,12 @@ function fakeUpstreamResponse(
   } as unknown as Response;
 }
 
+// What ClickHouse's prometheus_api_v1 handler answers the router's
+// `format_query` probe with. Queue this before the real upstream response in any
+// test that expects a ClickHouse connection to be proxied.
+const handlerProbeResponse = () =>
+  fakeUpstreamResponse({ status: 'success', data: 'up' });
+
 describe('prometheus router', () => {
   const server = getServer();
 
@@ -60,11 +82,28 @@ describe('prometheus router', () => {
     await server.stop();
   });
 
-  const seedPrometheusConnection = async (
+  const seedPromqlSource = (
+    connection: { _id: Types.ObjectId | string; team: Types.ObjectId },
+    {
+      name = 'PromQL',
+      databaseName = DEFAULT_DATABASE,
+      tableName = 'metrics_ts',
+    }: { name?: string; databaseName?: string; tableName?: string } = {},
+  ) =>
+    Source.create({
+      kind: SourceKind.Promql,
+      team: connection.team,
+      connection: connection._id,
+      name,
+      from: { databaseName, tableName },
+      timestampValueExpression: 'timestamp',
+    });
+
+  const seedPrometheusSource = async (
     teamId: Types.ObjectId,
     host = 'http://prom.example.com',
   ) => {
-    return Connection.create({
+    const connection = await Connection.create({
       team: teamId,
       name: 'Prom',
       host,
@@ -72,16 +111,21 @@ describe('prometheus router', () => {
       password: '',
       isPrometheusEndpoint: true,
     });
+    return seedPromqlSource(connection);
   };
 
-  const seedClickHouseConnection = async (teamId: Types.ObjectId) => {
-    return Connection.create({
+  const seedClickHouseSource = async (
+    teamId: Types.ObjectId,
+    from?: { databaseName?: string; tableName?: string },
+  ) => {
+    const connection = await Connection.create({
       team: teamId,
       name: 'CH',
       host: config.CLICKHOUSE_HOST,
       username: config.CLICKHOUSE_USER,
       password: config.CLICKHOUSE_PASSWORD,
     });
+    return seedPromqlSource(connection, from);
   };
 
   describe('GET /v1/prometheus/query_range', () => {
@@ -94,7 +138,7 @@ describe('prometheus router', () => {
       const { agent } = await getLoggedInAgent(server);
       const res = await agent
         .get('/v1/prometheus/query_range')
-        .query({ connectionId: new Types.ObjectId().toString() })
+        .query({ sourceId: new Types.ObjectId().toString() })
         .expect(400);
       expect(res.body).toMatchObject({
         status: 'error',
@@ -103,32 +147,50 @@ describe('prometheus router', () => {
       });
     });
 
-    it('returns 400 when connectionId parameter is missing', async () => {
+    it('returns 400 when sourceId parameter is missing', async () => {
       const { agent } = await getLoggedInAgent(server);
       const res = await agent
         .get('/v1/prometheus/query_range')
         .query({ query: 'up' })
         .expect(400);
-      expect(res.body).toMatchObject({
+      expect(res.body).toEqual({
         status: 'error',
         errorType: 'bad_data',
-        error: expect.stringContaining('connectionId'),
+        error: 'missing required parameter: sourceId',
       });
     });
 
-    it('returns 404 when connection does not exist', async () => {
+    it('returns 404 when source does not exist', async () => {
       const { agent } = await getLoggedInAgent(server);
       const res = await agent
         .get('/v1/prometheus/query_range')
         .query({
           query: 'up',
-          connectionId: new Types.ObjectId().toString(),
+          sourceId: new Types.ObjectId().toString(),
         })
+        .expect(404);
+      expect(res.body).toMatchObject({
+        status: 'error',
+        error: 'Source not found',
+      });
+    });
+
+    it("returns 404 when the source's connection no longer exists", async () => {
+      const { agent, team } = await getLoggedInAgent(server);
+      const source = await seedPromqlSource({
+        _id: new Types.ObjectId(),
+        team: team._id,
+      });
+
+      const res = await agent
+        .get('/v1/prometheus/query_range')
+        .query({ query: 'up', sourceId: source._id.toString() })
         .expect(404);
       expect(res.body).toMatchObject({
         status: 'error',
         error: 'Connection not found',
       });
+      expect(mockFetch).not.toHaveBeenCalled();
     });
 
     // The connection host is member-configured, so its response body is untrusted
@@ -137,7 +199,7 @@ describe('prometheus router', () => {
     // render as script here.
     it('never forwards a non-JSON upstream content-type, and always sends nosniff', async () => {
       const { agent, team } = await getLoggedInAgent(server);
-      const conn = await seedPrometheusConnection(team._id);
+      const source = await seedPrometheusSource(team._id);
 
       mockFetch.mockResolvedValueOnce(
         fakeUpstreamResponse(
@@ -153,7 +215,7 @@ describe('prometheus router', () => {
           query: 'up',
           start: '1700000000',
           end: '1700000060',
-          connectionId: conn._id.toString(),
+          sourceId: source._id.toString(),
         })
         .expect(200);
 
@@ -169,7 +231,7 @@ describe('prometheus router', () => {
     // separate Content-Type headers into exactly this shape.
     it('does not forward a JSON content-type that carries a second media type', async () => {
       const { agent, team } = await getLoggedInAgent(server);
-      const conn = await seedPrometheusConnection(team._id);
+      const source = await seedPrometheusSource(team._id);
 
       mockFetch.mockResolvedValueOnce(
         fakeUpstreamResponse(
@@ -185,7 +247,7 @@ describe('prometheus router', () => {
           query: 'up',
           start: '1700000000',
           end: '1700000060',
-          connectionId: conn._id.toString(),
+          sourceId: source._id.toString(),
         })
         .expect(200);
 
@@ -200,7 +262,7 @@ describe('prometheus router', () => {
     // fallback: the upstream value must not survive even when it is valid JSON.
     it('relabels even a legitimate non-standard JSON content-type', async () => {
       const { agent, team } = await getLoggedInAgent(server);
-      const conn = await seedPrometheusConnection(team._id);
+      const source = await seedPrometheusSource(team._id);
 
       mockFetch.mockResolvedValueOnce(
         fakeUpstreamResponse(
@@ -216,7 +278,7 @@ describe('prometheus router', () => {
           query: 'up',
           start: '1700000000',
           end: '1700000060',
-          connectionId: conn._id.toString(),
+          sourceId: source._id.toString(),
         })
         .expect(200);
 
@@ -231,7 +293,7 @@ describe('prometheus router', () => {
     // connection host into a body the browser shows.
     it('sends nosniff on a 502 and redacts credentials from the message', async () => {
       const { agent, team } = await getLoggedInAgent(server);
-      const conn = await seedPrometheusConnection(
+      const source = await seedPrometheusSource(
         team._id,
         'http://user:s3cr3t@prom.example.com',
       );
@@ -248,7 +310,7 @@ describe('prometheus router', () => {
           query: 'up',
           start: '1700000000',
           end: '1700000060',
-          connectionId: conn._id.toString(),
+          sourceId: source._id.toString(),
         })
         .expect(502);
 
@@ -264,7 +326,7 @@ describe('prometheus router', () => {
     // secret-shaped parts of it, or this leaks into the 502 body.
     it('does not leak a secret pinned in the host query string into the 502 message', async () => {
       const { agent, team } = await getLoggedInAgent(server);
-      const conn = await seedPrometheusConnection(
+      const source = await seedPrometheusSource(
         team._id,
         'http://prom.example.com?authKey=super-secret-token',
       );
@@ -281,7 +343,7 @@ describe('prometheus router', () => {
           query: 'up',
           start: '1700000000',
           end: '1700000060',
-          connectionId: conn._id.toString(),
+          sourceId: source._id.toString(),
         })
         .expect(502);
 
@@ -296,7 +358,7 @@ describe('prometheus router', () => {
     // `target` here specifically) would still be caught.
     it('does not leak credentials or a host query-string secret into the 504 message', async () => {
       const { agent, team } = await getLoggedInAgent(server);
-      const conn = await seedPrometheusConnection(
+      const source = await seedPrometheusSource(
         team._id,
         'http://user:s3cr3t@prom.example.com?authKey=super-secret-token',
       );
@@ -313,7 +375,7 @@ describe('prometheus router', () => {
           query: 'up',
           start: '1700000000',
           end: '1700000060',
-          connectionId: conn._id.toString(),
+          sourceId: source._id.toString(),
         })
         .expect(504);
 
@@ -326,7 +388,7 @@ describe('prometheus router', () => {
     // which echo the caller-supplied host — carry it too.
     it('sends nosniff on its own error responses', async () => {
       const { agent, team } = await getLoggedInAgent(server);
-      const conn = await seedPrometheusConnection(team._id, 'not-a-valid-url');
+      const source = await seedPrometheusSource(team._id, 'not-a-valid-url');
 
       const res = await agent
         .get('/v1/prometheus/query_exemplars')
@@ -334,7 +396,7 @@ describe('prometheus router', () => {
           query: 'up',
           start: '1700000000',
           end: '1700000060',
-          connectionId: conn._id.toString(),
+          sourceId: source._id.toString(),
         })
         .expect(400);
 
@@ -343,7 +405,7 @@ describe('prometheus router', () => {
 
     it('returns 400 for a scheme-less connection host instead of 502', async () => {
       const { agent, team } = await getLoggedInAgent(server);
-      const conn = await seedPrometheusConnection(team._id, 'prometheus:9090');
+      const source = await seedPrometheusSource(team._id, 'prometheus:9090');
 
       const res = await agent
         .get('/v1/prometheus/query_range')
@@ -352,7 +414,7 @@ describe('prometheus router', () => {
           start: '1700000000',
           end: '1700000060',
           step: '15s',
-          connectionId: conn._id.toString(),
+          sourceId: source._id.toString(),
         })
         .expect(400);
 
@@ -369,7 +431,7 @@ describe('prometheus router', () => {
     // interpolate the raw host back in would fail the suite.
     it('never echoes the connection host (or any credentials in it) in the 400 body', async () => {
       const { agent, team } = await getLoggedInAgent(server);
-      const conn = await seedPrometheusConnection(
+      const source = await seedPrometheusSource(
         team._id,
         'user:secret-password@prometheus:9090',
       );
@@ -381,7 +443,7 @@ describe('prometheus router', () => {
           start: '1700000000',
           end: '1700000060',
           step: '15s',
-          connectionId: conn._id.toString(),
+          sourceId: source._id.toString(),
         })
         .expect(400);
 
@@ -393,7 +455,7 @@ describe('prometheus router', () => {
 
     it('proxies to upstream Prometheus when connection isPrometheusEndpoint', async () => {
       const { agent, team } = await getLoggedInAgent(server);
-      const conn = await seedPrometheusConnection(team._id);
+      const source = await seedPrometheusSource(team._id);
 
       const promResponse = {
         status: 'success',
@@ -408,7 +470,7 @@ describe('prometheus router', () => {
           start: '1700000000',
           end: '1700000060',
           step: '15s',
-          connectionId: conn._id.toString(),
+          sourceId: source._id.toString(),
         })
         .expect(200);
 
@@ -418,14 +480,14 @@ describe('prometheus router', () => {
       expect(calledUrl).toContain('http://prom.example.com');
       expect(calledUrl).toContain('/api/v1/query_range');
       expect(calledUrl).toContain('query=up');
-      expect(calledUrl).not.toContain('connectionId');
+      expect(calledUrl).not.toContain('sourceId');
     });
 
     // Pins the call site, not just the helper: reverting
     // `url = new URL(path, upstreamHost)` would drop `/select/0/prometheus`.
     it('keeps a VictoriaMetrics cluster path prefix on the upstream URL', async () => {
       const { agent, team } = await getLoggedInAgent(server);
-      const conn = await seedPrometheusConnection(
+      const source = await seedPrometheusSource(
         team._id,
         'http://vmselect:8481/select/0/prometheus',
       );
@@ -444,7 +506,7 @@ describe('prometheus router', () => {
           start: '1700000000',
           end: '1700000060',
           step: '15s',
-          connectionId: conn._id.toString(),
+          sourceId: source._id.toString(),
         })
         .expect(200);
 
@@ -460,7 +522,7 @@ describe('prometheus router', () => {
     // silently stop authenticating.
     it('still sends real credentials to the actual upstream fetch call', async () => {
       const { agent, team } = await getLoggedInAgent(server);
-      const conn = await seedPrometheusConnection(
+      const source = await seedPrometheusSource(
         team._id,
         'http://user:pw@prom.example.com',
       );
@@ -479,7 +541,7 @@ describe('prometheus router', () => {
           start: '1700000000',
           end: '1700000060',
           step: '15s',
-          connectionId: conn._id.toString(),
+          sourceId: source._id.toString(),
         })
         .expect(200);
 
@@ -488,7 +550,7 @@ describe('prometheus router', () => {
 
     it('leaves a host-pinned param untouched when the request never references it', async () => {
       const { agent, team } = await getLoggedInAgent(server);
-      const conn = await seedPrometheusConnection(
+      const source = await seedPrometheusSource(
         team._id,
         'http://vmselect:8481/select/0/prometheus?extra_label=namespace%3Dprod',
       );
@@ -507,7 +569,7 @@ describe('prometheus router', () => {
           start: '1700000000',
           end: '1700000060',
           step: '15s',
-          connectionId: conn._id.toString(),
+          sourceId: source._id.toString(),
         })
         .expect(200);
 
@@ -523,7 +585,7 @@ describe('prometheus router', () => {
     // connection return the same series regardless of what was requested).
     it('lets a request query param override a same-named one pinned on the connection host', async () => {
       const { agent, team } = await getLoggedInAgent(server);
-      const conn = await seedPrometheusConnection(
+      const source = await seedPrometheusSource(
         team._id,
         'http://vmselect:8481/select/0/prometheus?query=host_pinned_query',
       );
@@ -542,7 +604,7 @@ describe('prometheus router', () => {
           start: '1700000000',
           end: '1700000060',
           step: '15s',
-          connectionId: conn._id.toString(),
+          sourceId: source._id.toString(),
         })
         .expect(200);
 
@@ -557,7 +619,7 @@ describe('prometheus router', () => {
     // guarantee for every param this list claims to cover.
     it('forwards a request timeout, overriding one pinned on the connection host', async () => {
       const { agent, team } = await getLoggedInAgent(server);
-      const conn = await seedPrometheusConnection(
+      const source = await seedPrometheusSource(
         team._id,
         'http://prom.example.com?timeout=5s',
       );
@@ -577,7 +639,7 @@ describe('prometheus router', () => {
           end: '1700000060',
           step: '15s',
           timeout: '30s',
-          connectionId: conn._id.toString(),
+          sourceId: source._id.toString(),
         })
         .expect(200);
 
@@ -590,7 +652,7 @@ describe('prometheus router', () => {
     // be caught.
     it('forwards a request stats value, overriding one pinned on the connection host', async () => {
       const { agent, team } = await getLoggedInAgent(server);
-      const conn = await seedPrometheusConnection(
+      const source = await seedPrometheusSource(
         team._id,
         'http://prom.example.com?stats=all',
       );
@@ -610,7 +672,7 @@ describe('prometheus router', () => {
           end: '1700000060',
           step: '15s',
           stats: 'none',
-          connectionId: conn._id.toString(),
+          sourceId: source._id.toString(),
         })
         .expect(200);
 
@@ -627,7 +689,7 @@ describe('prometheus router', () => {
     // param just by naming it.
     it('does not let a request override a non-Prometheus param pinned on the connection host', async () => {
       const { agent, team } = await getLoggedInAgent(server);
-      const conn = await seedPrometheusConnection(
+      const source = await seedPrometheusSource(
         team._id,
         'http://vmselect:8481/select/0/prometheus?extra_label=namespace%3Dprod',
       );
@@ -647,7 +709,7 @@ describe('prometheus router', () => {
           end: '1700000060',
           step: '15s',
           extra_label: 'namespace=other',
-          connectionId: conn._id.toString(),
+          sourceId: source._id.toString(),
         })
         .expect(200);
 
@@ -658,7 +720,7 @@ describe('prometheus router', () => {
 
     it('lets the request step override a step pinned on the connection host', async () => {
       const { agent, team } = await getLoggedInAgent(server);
-      const conn = await seedPrometheusConnection(
+      const source = await seedPrometheusSource(
         team._id,
         'http://prom.example.com?step=5m',
       );
@@ -677,7 +739,7 @@ describe('prometheus router', () => {
           start: '1700000000',
           end: '1700000060',
           step: '15s',
-          connectionId: conn._id.toString(),
+          sourceId: source._id.toString(),
         })
         .expect(200);
 
@@ -685,26 +747,479 @@ describe('prometheus router', () => {
       expect(requested.searchParams.get('step')).toBe('15s');
     });
 
-    it('does NOT proxy to Prometheus when connection is not isPrometheusEndpoint', async () => {
+    it("proxies a ClickHouse connection to its prometheus_api_v1 handler with the source's db/table and credentials", async () => {
       const { agent, team } = await getLoggedInAgent(server);
-      const conn = await seedClickHouseConnection(team._id);
+      const source = await seedClickHouseSource(team._id, {
+        databaseName: 'otel',
+        tableName: 'metrics_ts',
+      });
+      const promResponse = {
+        status: 'success',
+        data: { resultType: 'matrix', result: [] },
+      };
+      mockFetch
+        .mockResolvedValueOnce(handlerProbeResponse())
+        .mockResolvedValueOnce(fakeUpstreamResponse(promResponse));
 
-      // ClickHouse path: will likely fail with 400 because metrics_ts
-      // is not seeded in the test CH, but the routing decision is what we
-      // care about — fetch must not be called.
-      await agent.get('/v1/prometheus/query_range').query({
-        query: 'up',
-        start: '1700000000',
-        end: '1700000060',
-        connectionId: conn._id.toString(),
+      const res = await agent
+        .get('/v1/prometheus/query_range')
+        .query({
+          query: 'up',
+          start: '1700000000',
+          end: '1700000060',
+          step: '15s',
+          sourceId: source._id.toString(),
+        })
+        .expect(200);
+
+      expect(res.body).toEqual(promResponse);
+      expect(mockFetch).toHaveBeenCalledTimes(2);
+      const [probeUrl, probeInit] = mockFetch.mock.calls[0];
+      expect(String(probeUrl)).toContain(
+        `${config.CLICKHOUSE_HOST}/prometheus/api/v1/format_query?query=up`,
+      );
+      expect(probeInit?.headers).toMatchObject({
+        'X-ClickHouse-User': config.CLICKHOUSE_USER,
+      });
+      const [calledUrl, init] = mockFetch.mock.calls[1];
+      expect(calledUrl).toContain(
+        `${config.CLICKHOUSE_HOST}/prometheus/api/v1/query_range`,
+      );
+      expect(calledUrl).toContain('database=otel');
+      expect(calledUrl).toContain('table=metrics_ts');
+      expect(calledUrl).toContain('max_execution_time=30');
+      expect(calledUrl).toContain('max_result_rows=100000');
+      expect(calledUrl).not.toContain('sourceId');
+      expect(init?.headers).toMatchObject({
+        'X-ClickHouse-User': config.CLICKHOUSE_USER,
+        'X-ClickHouse-Key': config.CLICKHOUSE_PASSWORD,
+      });
+    });
+
+    it.each(['query_range', 'query'])(
+      "ignores a caller-supplied database/table on /%s and queries the source's",
+      async endpoint => {
+        const { agent, team } = await getLoggedInAgent(server);
+        const source = await seedClickHouseSource(team._id, {
+          databaseName: 'otel',
+          tableName: 'metrics_ts',
+        });
+        mockFetch.mockResolvedValueOnce(handlerProbeResponse());
+
+        await agent
+          .get(`/v1/prometheus/${endpoint}`)
+          .query({
+            query: 'up',
+            start: '1700000000',
+            end: '1700000060',
+            step: '15s',
+            database: 'other_db',
+            table: 'other_table',
+            sourceId: source._id.toString(),
+          })
+          .expect(200);
+
+        const calledUrl = new URL(String(mockFetch.mock.calls[1][0]));
+        expect(calledUrl.pathname).toBe(
+          `${CLICKHOUSE_PROMETHEUS_API_PREFIX}/${endpoint}`,
+        );
+        expect(calledUrl.searchParams.getAll('database')).toEqual(['otel']);
+        expect(calledUrl.searchParams.getAll('table')).toEqual(['metrics_ts']);
+      },
+    );
+
+    it('tags a request proxied to prometheus_api_v1 with log_comment and query_id', async () => {
+      const { agent, team } = await getLoggedInAgent(server);
+      const source = await seedClickHouseSource(team._id);
+      mockFetch.mockResolvedValueOnce(handlerProbeResponse());
+
+      await agent
+        .get('/v1/prometheus/query_range')
+        .set(
+          QUERY_ATTRIBUTION_HEADER,
+          buildLogComment({ surface: 'dashboard', tile: 'tile-1' })!,
+        )
+        .query({
+          query: 'up',
+          start: '1700000000',
+          end: '1700000060',
+          step: '15s',
+          // Not caller-settable, so this never reaches the upstream.
+          log_comment: 'from-caller',
+          sourceId: source._id.toString(),
+        })
+        .expect(200);
+
+      const [calledUrl, init] = mockFetch.mock.calls[1];
+      const url = new URL(String(calledUrl));
+      expect(url.searchParams.getAll('log_comment')).toHaveLength(1);
+      expect(JSON.parse(url.searchParams.get('log_comment')!)).toMatchObject({
+        surface: 'dashboard',
+        tile: 'tile-1',
+        label: '/v1/prometheus',
+      });
+      // In the URL, ClickHouse fails the request on query_id as an unknown
+      // setting.
+      expect(url.searchParams.has('query_id')).toBe(false);
+      expect(init?.headers).toMatchObject({
+        'X-ClickHouse-Query-Id': expect.stringMatching(/^hdx-dashboard-/),
+      });
+    });
+
+    it('does not let the request loosen the pinned ClickHouse limits', async () => {
+      const { agent, team } = await getLoggedInAgent(server);
+      const source = await seedClickHouseSource(team._id);
+      mockFetch.mockResolvedValueOnce(handlerProbeResponse());
+
+      await agent
+        .get('/v1/prometheus/query_range')
+        .query({
+          query: 'up',
+          start: '1700000000',
+          end: '1700000060',
+          step: '15s',
+          max_execution_time: '9999',
+          max_result_rows: '0',
+          sourceId: source._id.toString(),
+        })
+        .expect(200);
+
+      const calledUrl = new URL(String(mockFetch.mock.calls[1][0]));
+      expect(calledUrl.searchParams.getAll('max_execution_time')).toEqual([
+        '30',
+      ]);
+      expect(calledUrl.searchParams.getAll('max_result_rows')).toEqual([
+        '100000',
+      ]);
+    });
+
+    it('falls back to prometheusQueryRange() when the server has no prometheus_api_v1 handler', async () => {
+      const { agent, team } = await getLoggedInAgent(server);
+      const source = await seedClickHouseSource(team._id, {
+        tableName: 'no_such_table_for_fallback',
+      });
+      // A stock ClickHouse answers the probe with a plain-text 404.
+      mockFetch.mockResolvedValueOnce({
+        status: 404,
+        text: jest
+          .fn()
+          .mockResolvedValue(
+            'There is no handle /prometheus/api/v1/format_query',
+          ),
+      } as unknown as Response);
+
+      const res = await agent
+        .get('/v1/prometheus/query_range')
+        .query({
+          query: 'up',
+          start: '1700000000',
+          end: '1700000060',
+          step: '60s',
+          sourceId: source._id.toString(),
+        })
+        .expect(400);
+
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+      // The table function ran (and failed on the missing table); the
+      // upstream was never asked to evaluate the query.
+      expect(res.body.error).toMatch(/no_such_table_for_fallback/);
+    });
+
+    // The one place the proxy meets a real prometheus_api_v1 handler: the CI
+    // ClickHouse (26.8, docker/clickhouse/local/config.xml) serves it, so the
+    // stubbed fetch is swapped for the real one and the answer has to be
+    // Prometheus-shaped data from a seeded table. Every other proxy test only
+    // pins the request shape.
+    describe('against the CI ClickHouse prometheus_api_v1 handler', () => {
+      const TABLE = 'prom_http_api_live';
+      const START = 1700000000;
+
+      beforeAll(async () => {
+        await seedTimeSeriesTagsTable({
+          table: TABLE,
+          series: [
+            {
+              metricName: 'live_up',
+              tags: { job: 'api' },
+              startSec: START,
+              endSec: START + 60,
+            },
+            {
+              metricName: 'live_up',
+              tags: { job: 'web' },
+              startSec: START,
+              endSec: START + 60,
+            },
+          ],
+          withSamples: true,
+        });
       });
 
-      expect(mockFetch).not.toHaveBeenCalled();
+      afterAll(async () => {
+        await dropTimeSeriesTable({ table: TABLE });
+      });
+
+      beforeEach(() => {
+        mockFetch.mockImplementation(realFetch);
+      });
+
+      it("answers a range query with the series from the source's table", async () => {
+        const { agent, team } = await getLoggedInAgent(server);
+        const source = await seedClickHouseSource(team._id, {
+          tableName: TABLE,
+        });
+
+        const res = await agent
+          .get('/v1/prometheus/query_range')
+          .query({
+            query: 'sum by (job) (live_up)',
+            start: String(START),
+            end: String(START + 60),
+            step: '60s',
+            sourceId: source._id.toString(),
+          })
+          .expect(200);
+
+        expect(res.headers['content-type']).toMatch(/application\/json/);
+        expect(res.body.status).toBe('success');
+        expect(res.body.data.resultType).toBe('matrix');
+        const byJob = Object.fromEntries(
+          res.body.data.result.map((r: any) => [r.metric.job, r.values]),
+        );
+        expect(Object.keys(byJob).sort()).toEqual(['api', 'web']);
+        expect(byJob.api).toEqual(
+          expect.arrayContaining([
+            [START, '1'],
+            [START + 60, '1'],
+          ]),
+        );
+      });
+
+      it('answers an instant query', async () => {
+        const { agent, team } = await getLoggedInAgent(server);
+        const source = await seedClickHouseSource(team._id, {
+          tableName: TABLE,
+        });
+
+        const res = await agent
+          .get('/v1/prometheus/query')
+          .query({
+            query: 'count(live_up)',
+            time: String(START + 60),
+            sourceId: source._id.toString(),
+          })
+          .expect(200);
+
+        expect(res.body).toEqual({
+          status: 'success',
+          data: {
+            resultType: 'vector',
+            result: [{ metric: {}, value: [START + 60, '2'] }],
+          },
+        });
+      });
+
+      // The router's limits are compile-time constants far above anything a
+      // test can exceed, so the same URL builder is driven at tiny values
+      // straight at the handler. This pins the property the router relies on:
+      // settings in the URL are applied to the PromQL evaluation and a breach
+      // comes back as a Prometheus 400, not as a truncated 200.
+      const liveRangeQuery = async (limits: {
+        maxExecutionSec?: number;
+        maxResultRows?: number;
+      }) => {
+        const url = joinPrometheusUpstreamUrl(
+          clickhousePrometheusUpstream(config.CLICKHOUSE_HOST, limits),
+          `${CLICKHOUSE_PROMETHEUS_API_PREFIX}/query_range`,
+        );
+        for (const [k, v] of Object.entries({
+          query: 'live_up',
+          start: String(START),
+          end: String(START + 60),
+          step: '60',
+          database: DEFAULT_DATABASE,
+          table: TABLE,
+        })) {
+          url.searchParams.set(k, v);
+        }
+        const resp = await realFetch(url, {
+          headers: {
+            'X-ClickHouse-User': config.CLICKHOUSE_USER,
+            'X-ClickHouse-Key': config.CLICKHOUSE_PASSWORD,
+          },
+        });
+        return { status: resp.status, body: await resp.json() };
+      };
+
+      it('enforces max_result_rows pinned on the upstream URL', async () => {
+        const { status, body } = await liveRangeQuery({ maxResultRows: 1 });
+        expect(status).toBe(400);
+        expect(body).toMatchObject({
+          status: 'error',
+          errorType: 'bad_data',
+          error: expect.stringMatching(/Limit for result exceeded/),
+        });
+      });
+
+      it('enforces max_execution_time pinned on the upstream URL', async () => {
+        const { status, body } = await liveRangeQuery({
+          maxExecutionSec: 0.0001,
+        });
+        expect(status).toBe(400);
+        expect(body).toMatchObject({
+          status: 'error',
+          errorType: 'bad_data',
+          error: expect.stringMatching(/Timeout exceeded/),
+        });
+      });
+
+      it('answers in full at the limits the router pins', async () => {
+        const { status, body } = await liveRangeQuery({});
+        expect(status).toBe(200);
+        expect(body.data.result).toHaveLength(2);
+      });
+
+      it('relays a PromQL parse error as a Prometheus 400', async () => {
+        const { agent, team } = await getLoggedInAgent(server);
+        const source = await seedClickHouseSource(team._id, {
+          tableName: TABLE,
+        });
+
+        const res = await agent
+          .get('/v1/prometheus/query')
+          .query({
+            query: 'live_up(',
+            sourceId: source._id.toString(),
+          })
+          .expect(400);
+
+        expect(res.body).toMatchObject({
+          status: 'error',
+          errorType: 'bad_data',
+          error: expect.stringContaining('PromQL'),
+        });
+      });
+    });
+
+    describe('on ClickHouse without the Prometheus HTTP API (< 26.6)', () => {
+      const TABLE = 'prom_query_range_fallback';
+      const START = 1700000000;
+
+      beforeAll(async () => {
+        await seedTimeSeriesTagsTable({
+          table: TABLE,
+          series: [
+            {
+              metricName: 'fallback_up',
+              tags: { job: 'api' },
+              startSec: START,
+              endSec: START + 60,
+            },
+          ],
+          withSamples: true,
+        });
+      });
+
+      afterAll(async () => {
+        await dropTimeSeriesTable({ table: TABLE });
+      });
+
+      beforeEach(() => {
+        jest
+          .spyOn(Metadata.prototype, 'getServerVersion')
+          .mockResolvedValue([26, 5, 0, 0]);
+      });
+
+      afterEach(() => {
+        jest.restoreAllMocks();
+      });
+
+      it('evaluates through prometheusQueryRange() instead of proxying', async () => {
+        const { agent, team } = await getLoggedInAgent(server);
+        const source = await seedClickHouseSource(team._id, {
+          tableName: TABLE,
+        });
+
+        const res = await agent
+          .get('/v1/prometheus/query_range')
+          .query({
+            query: 'fallback_up',
+            start: String(START),
+            end: String(START + 60),
+            step: '60s',
+            sourceId: source._id.toString(),
+          })
+          .expect(200);
+
+        expect(mockFetch).not.toHaveBeenCalled();
+        expect(res.body.status).toBe('success');
+        expect(res.body.data.resultType).toBe('matrix');
+        expect(res.body.data.result).toEqual([
+          {
+            metric: { __name__: 'fallback_up', job: 'api' },
+            values: expect.arrayContaining([[START, '1']]),
+          },
+        ]);
+      });
+
+      it('evaluates an instant query through prometheusQuery()', async () => {
+        const { agent, team } = await getLoggedInAgent(server);
+        const source = await seedClickHouseSource(team._id, {
+          tableName: TABLE,
+        });
+
+        const res = await agent
+          .get('/v1/prometheus/query')
+          .query({
+            query: 'fallback_up',
+            time: String(START + 60),
+            sourceId: source._id.toString(),
+          })
+          .expect(200);
+
+        expect(mockFetch).not.toHaveBeenCalled();
+        expect(res.body.data.resultType).toBe('vector');
+        expect(res.body.data.result).toEqual([
+          {
+            metric: { __name__: 'fallback_up', job: 'api' },
+            value: [START + 60, '1'],
+          },
+        ]);
+      });
+
+      // A caller-named table that does not exist would fail the table function,
+      // so a 200 with the seeded series shows the source's table was queried.
+      it.each([
+        ['query_range', { start: String(START), end: String(START + 60) }],
+        ['query', { time: String(START + 60) }],
+      ])(
+        "ignores a caller-supplied database/table on /%s and queries the source's",
+        async (endpoint, window) => {
+          const { agent, team } = await getLoggedInAgent(server);
+          const source = await seedClickHouseSource(team._id, {
+            tableName: TABLE,
+          });
+
+          const res = await agent
+            .get(`/v1/prometheus/${endpoint}`)
+            .query({
+              query: 'fallback_up',
+              ...window,
+              database: 'no_such_database',
+              table: 'no_such_table',
+              sourceId: source._id.toString(),
+            })
+            .expect(200);
+
+          expect(res.body.status).toBe('success');
+          expect(res.body.data.result).toHaveLength(1);
+        },
+      );
     });
 
     it('returns 400 with Prometheus-compatible error when resolution exceeds 11,000 points', async () => {
       const { agent, team } = await getLoggedInAgent(server);
-      const conn = await seedClickHouseConnection(team._id);
+      const source = await seedClickHouseSource(team._id);
 
       const res = await agent
         .get('/v1/prometheus/query_range')
@@ -713,8 +1228,7 @@ describe('prometheus router', () => {
           start: '0',
           end: '1700000000',
           step: '1s',
-          connectionId: conn._id.toString(),
-          table: 'metrics_ts',
+          sourceId: source._id.toString(),
         })
         .expect(400);
       expect(res.body).toMatchObject({
@@ -731,11 +1245,11 @@ describe('prometheus router', () => {
       const { agent } = await getLoggedInAgent(server);
       await agent
         .get('/v1/prometheus/query')
-        .query({ connectionId: new Types.ObjectId().toString() })
+        .query({ sourceId: new Types.ObjectId().toString() })
         .expect(400);
     });
 
-    it('returns 400 when connectionId parameter is missing', async () => {
+    it('returns 400 when sourceId parameter is missing', async () => {
       const { agent } = await getLoggedInAgent(server);
       await agent
         .get('/v1/prometheus/query')
@@ -743,20 +1257,20 @@ describe('prometheus router', () => {
         .expect(400);
     });
 
-    it('returns 404 when connection does not exist', async () => {
+    it('returns 404 when source does not exist', async () => {
       const { agent } = await getLoggedInAgent(server);
       await agent
         .get('/v1/prometheus/query')
         .query({
           query: 'up',
-          connectionId: new Types.ObjectId().toString(),
+          sourceId: new Types.ObjectId().toString(),
         })
         .expect(404);
     });
 
     it('proxies to upstream Prometheus when connection isPrometheusEndpoint', async () => {
       const { agent, team } = await getLoggedInAgent(server);
-      const conn = await seedPrometheusConnection(team._id);
+      const source = await seedPrometheusSource(team._id);
 
       const promResponse = {
         status: 'success',
@@ -766,7 +1280,7 @@ describe('prometheus router', () => {
 
       const res = await agent
         .get('/v1/prometheus/query')
-        .query({ query: 'up', connectionId: conn._id.toString() })
+        .query({ query: 'up', sourceId: source._id.toString() })
         .expect(200);
 
       expect(res.body).toEqual(promResponse);
@@ -775,10 +1289,44 @@ describe('prometheus router', () => {
       expect(calledUrl).toContain('/api/v1/query');
       expect(calledUrl).not.toContain('/api/v1/query_range');
     });
+
+    it('proxies a ClickHouse connection to its prometheus_api_v1 handler', async () => {
+      const { agent, team } = await getLoggedInAgent(server);
+      const source = await seedClickHouseSource(team._id, {
+        tableName: 'metrics_ts',
+      });
+      mockFetch
+        .mockResolvedValueOnce(handlerProbeResponse())
+        .mockResolvedValueOnce(
+          fakeUpstreamResponse({
+            status: 'success',
+            data: { resultType: 'vector', result: [] },
+          }),
+        );
+
+      await agent
+        .get('/v1/prometheus/query')
+        .query({
+          query: 'up',
+          sourceId: source._id.toString(),
+        })
+        .expect(200);
+
+      const [calledUrl, init] = mockFetch.mock.calls[1];
+      expect(calledUrl).toContain(
+        `${config.CLICKHOUSE_HOST}/prometheus/api/v1/query?`,
+      );
+      expect(calledUrl).toContain('table=metrics_ts');
+      expect(calledUrl).toContain('max_execution_time=30');
+      expect(calledUrl).toContain('max_result_rows=100000');
+      expect(init?.headers).toMatchObject({
+        'X-ClickHouse-User': config.CLICKHOUSE_USER,
+      });
+    });
   });
 
   describe('GET /v1/prometheus/label/:name/values', () => {
-    it('returns 400 when connectionId parameter is missing', async () => {
+    it('returns 400 when sourceId parameter is missing', async () => {
       const { agent } = await getLoggedInAgent(server);
       await agent.get('/v1/prometheus/label/__name__/values').expect(400);
     });
@@ -787,40 +1335,40 @@ describe('prometheus router', () => {
     // instead turns a client error into a cast failure that the handler's
     // catch-all reports as a backend fault.
     it.each(['', 'not-an-object-id'])(
-      'returns 400 for connectionId %p',
-      async connectionId => {
+      'returns 400 for sourceId %p',
+      async sourceId => {
         const { agent } = await getLoggedInAgent(server);
         const res = await agent
           .get('/v1/prometheus/label/__name__/values')
-          .query({ connectionId })
+          .query({ sourceId })
           .expect(400);
 
         expect(res.body).toMatchObject({
           status: 'error',
           errorType: 'bad_data',
-          error: expect.stringContaining('connectionId'),
+          error: expect.stringContaining('sourceId'),
         });
       },
     );
 
-    it('returns 404 when connection does not exist', async () => {
+    it('returns 404 when source does not exist', async () => {
       const { agent } = await getLoggedInAgent(server);
       await agent
         .get('/v1/prometheus/label/__name__/values')
-        .query({ connectionId: new Types.ObjectId().toString() })
+        .query({ sourceId: new Types.ObjectId().toString() })
         .expect(404);
     });
 
     it('proxies to upstream Prometheus when connection isPrometheusEndpoint', async () => {
       const { agent, team } = await getLoggedInAgent(server);
-      const conn = await seedPrometheusConnection(team._id);
+      const source = await seedPrometheusSource(team._id);
 
       const promResponse = { status: 'success', data: ['up', 'requests'] };
       mockFetch.mockResolvedValueOnce(fakeUpstreamResponse(promResponse));
 
       const res = await agent
         .get('/v1/prometheus/label/__name__/values')
-        .query({ connectionId: conn._id.toString() })
+        .query({ sourceId: source._id.toString() })
         .expect(200);
 
       expect(res.body).toEqual(promResponse);
@@ -830,12 +1378,12 @@ describe('prometheus router', () => {
 
     it('forwards normalized bounds upstream', async () => {
       const { agent, team } = await getLoggedInAgent(server);
-      const conn = await seedPrometheusConnection(team._id);
+      const source = await seedPrometheusSource(team._id);
 
       await agent
         .get('/v1/prometheus/label/job/values')
         .query({
-          connectionId: conn._id.toString(),
+          sourceId: source._id.toString(),
           start: '2023-11-14T22:13:20Z',
           end: '1700000060',
         })
@@ -848,11 +1396,11 @@ describe('prometheus router', () => {
 
     it('sends no bounds upstream when the caller gives none', async () => {
       const { agent, team } = await getLoggedInAgent(server);
-      const conn = await seedPrometheusConnection(team._id);
+      const source = await seedPrometheusSource(team._id);
 
       await agent
         .get('/v1/prometheus/label/job/values')
-        .query({ connectionId: conn._id.toString() })
+        .query({ sourceId: source._id.toString() })
         .expect(200);
 
       const requested = new URL(String(mockFetch.mock.calls[0][0]));
@@ -864,11 +1412,11 @@ describe('prometheus router', () => {
     // epoch, which is what parseTimestamp('') -> Number('') would make it.
     it('treats an empty bound as absent rather than as the epoch', async () => {
       const { agent, team } = await getLoggedInAgent(server);
-      const conn = await seedPrometheusConnection(team._id);
+      const source = await seedPrometheusSource(team._id);
 
       await agent
         .get('/v1/prometheus/label/job/values')
-        .query({ connectionId: conn._id.toString(), start: '', end: '' })
+        .query({ sourceId: source._id.toString(), start: '', end: '' })
         .expect(200);
 
       const requested = new URL(String(mockFetch.mock.calls[0][0]));
@@ -880,11 +1428,11 @@ describe('prometheus router', () => {
     // would 400 every request carrying a limit.
     it('forwards limit upstream', async () => {
       const { agent, team } = await getLoggedInAgent(server);
-      const conn = await seedPrometheusConnection(team._id);
+      const source = await seedPrometheusSource(team._id);
 
       await agent
         .get('/v1/prometheus/label/job/values')
-        .query({ connectionId: conn._id.toString(), limit: '25' })
+        .query({ sourceId: source._id.toString(), limit: '25' })
         .expect(200);
 
       const requested = new URL(String(mockFetch.mock.calls[0][0]));
@@ -893,11 +1441,11 @@ describe('prometheus router', () => {
 
     it('treats an empty limit as absent', async () => {
       const { agent, team } = await getLoggedInAgent(server);
-      const conn = await seedPrometheusConnection(team._id);
+      const source = await seedPrometheusSource(team._id);
 
       await agent
         .get('/v1/prometheus/label/job/values')
-        .query({ connectionId: conn._id.toString(), limit: '' })
+        .query({ sourceId: source._id.toString(), limit: '' })
         .expect(200);
 
       const requested = new URL(String(mockFetch.mock.calls[0][0]));
@@ -908,11 +1456,11 @@ describe('prometheus router', () => {
     // limit means. Rejecting it would break a caller Prometheus itself accepts.
     it('drops a zero limit and still proxies', async () => {
       const { agent, team } = await getLoggedInAgent(server);
-      const conn = await seedPrometheusConnection(team._id);
+      const source = await seedPrometheusSource(team._id);
 
       await agent
         .get('/v1/prometheus/label/job/values')
-        .query({ connectionId: conn._id.toString(), limit: '0' })
+        .query({ sourceId: source._id.toString(), limit: '0' })
         .expect(200);
 
       const requested = new URL(String(mockFetch.mock.calls[0][0]));
@@ -927,14 +1475,14 @@ describe('prometheus router', () => {
     // reaching upstream, which the previous test guards separately).
     it('lets a request limit of 0 clear a non-zero limit pinned on the connection host', async () => {
       const { agent, team } = await getLoggedInAgent(server);
-      const conn = await seedPrometheusConnection(
+      const source = await seedPrometheusSource(
         team._id,
         'http://prom.example.com?limit=100',
       );
 
       await agent
         .get('/v1/prometheus/label/job/values')
-        .query({ connectionId: conn._id.toString(), limit: '0' })
+        .query({ sourceId: source._id.toString(), limit: '0' })
         .expect(200);
 
       const requested = new URL(String(mockFetch.mock.calls[0][0]));
@@ -943,11 +1491,11 @@ describe('prometheus router', () => {
 
     it('rejects a negative limit', async () => {
       const { agent, team } = await getLoggedInAgent(server);
-      const conn = await seedPrometheusConnection(team._id);
+      const source = await seedPrometheusSource(team._id);
 
       await agent
         .get('/v1/prometheus/label/job/values')
-        .query({ connectionId: conn._id.toString(), limit: '-1' })
+        .query({ sourceId: source._id.toString(), limit: '-1' })
         .expect(400);
 
       expect(mockFetch).not.toHaveBeenCalled();
@@ -955,11 +1503,11 @@ describe('prometheus router', () => {
 
     it('rejects a non-numeric limit', async () => {
       const { agent, team } = await getLoggedInAgent(server);
-      const conn = await seedPrometheusConnection(team._id);
+      const source = await seedPrometheusSource(team._id);
 
       await agent
         .get('/v1/prometheus/label/job/values')
-        .query({ connectionId: conn._id.toString(), limit: 'lots' })
+        .query({ sourceId: source._id.toString(), limit: 'lots' })
         .expect(400);
 
       expect(mockFetch).not.toHaveBeenCalled();
@@ -967,11 +1515,11 @@ describe('prometheus router', () => {
 
     it('rejects a malformed bound before reaching upstream', async () => {
       const { agent, team } = await getLoggedInAgent(server);
-      const conn = await seedPrometheusConnection(team._id);
+      const source = await seedPrometheusSource(team._id);
 
       const res = await agent
         .get('/v1/prometheus/label/job/values')
-        .query({ connectionId: conn._id.toString(), start: 'not-a-time' })
+        .query({ sourceId: source._id.toString(), start: 'not-a-time' })
         .expect(400);
 
       expect(res.body).toMatchObject({
@@ -986,12 +1534,12 @@ describe('prometheus router', () => {
     // backends answering the same request the same way.
     it('rejects an inverted range before reaching upstream', async () => {
       const { agent, team } = await getLoggedInAgent(server);
-      const conn = await seedPrometheusConnection(team._id);
+      const source = await seedPrometheusSource(team._id);
 
       const res = await agent
         .get('/v1/prometheus/label/job/values')
         .query({
-          connectionId: conn._id.toString(),
+          sourceId: source._id.toString(),
           start: '1700000000',
           end: '1600000000',
         })
@@ -1010,12 +1558,12 @@ describe('prometheus router', () => {
     // forwarded verbatim — a selector is PromQL, which only upstream parses.
     it('forwards every match[] selector verbatim', async () => {
       const { agent, team } = await getLoggedInAgent(server);
-      const conn = await seedPrometheusConnection(team._id);
+      const source = await seedPrometheusSource(team._id);
 
       await agent
         .get('/v1/prometheus/label/job/values')
         .query(
-          `connectionId=${conn._id.toString()}&start=2023-11-14T22:13:20Z` +
+          `sourceId=${source._id.toString()}&start=2023-11-14T22:13:20Z` +
             `&match[]=${encodeURIComponent('up{env="prod"}')}` +
             `&match[]=${encodeURIComponent('down')}`,
         )
@@ -1034,11 +1582,11 @@ describe('prometheus router', () => {
     // Prometheus reads.
     it('restores the bracketed name for an unbracketed match', async () => {
       const { agent, team } = await getLoggedInAgent(server);
-      const conn = await seedPrometheusConnection(team._id);
+      const source = await seedPrometheusSource(team._id);
 
       await agent
         .get('/v1/prometheus/label/job/values')
-        .query({ connectionId: conn._id.toString(), match: 'up' })
+        .query({ sourceId: source._id.toString(), match: 'up' })
         .expect(200);
 
       const requested = new URL(String(mockFetch.mock.calls[0][0]));
@@ -1048,11 +1596,11 @@ describe('prometheus router', () => {
 
     it('treats an empty match as absent', async () => {
       const { agent, team } = await getLoggedInAgent(server);
-      const conn = await seedPrometheusConnection(team._id);
+      const source = await seedPrometheusSource(team._id);
 
       await agent
         .get('/v1/prometheus/label/job/values')
-        .query({ connectionId: conn._id.toString(), match: '' })
+        .query({ sourceId: source._id.toString(), match: '' })
         .expect(200);
 
       const requested = new URL(String(mockFetch.mock.calls[0][0]));
@@ -1066,7 +1614,7 @@ describe('prometheus router', () => {
     // return the wrong series list).
     it('replaces a host-pinned match[] with the request values, not appends alongside them', async () => {
       const { agent, team } = await getLoggedInAgent(server);
-      const conn = await seedPrometheusConnection(
+      const source = await seedPrometheusSource(
         team._id,
         'http://prom.example.com?match%5B%5D=host-pinned-series',
       );
@@ -1074,7 +1622,7 @@ describe('prometheus router', () => {
       await agent
         .get('/v1/prometheus/label/job/values')
         .query({
-          connectionId: conn._id.toString(),
+          sourceId: source._id.toString(),
           match: ['requested-series-1', 'requested-series-2'],
         })
         .expect(200);
@@ -1105,15 +1653,12 @@ describe('prometheus router', () => {
         { labelName = '__name__', match = [] as string[] } = {},
       ) => {
         const { agent, team } = await getLoggedInAgent(server);
-        const conn = await seedClickHouseConnection(team._id);
+        const source = await seedClickHouseSource(team._id, {
+          tableName: TABLE,
+        });
         const res = await agent
           .get(`/v1/prometheus/label/${labelName}/values`)
-          .query({
-            connectionId: conn._id.toString(),
-            database: DEFAULT_DATABASE,
-            table: TABLE,
-            ...query,
-          })
+          .query({ sourceId: source._id.toString(), ...query })
           .query(matchQueryString(match))
           .expect(200);
         return res.body;
@@ -1166,14 +1711,14 @@ describe('prometheus router', () => {
       // inverted gap, while the proxy path 400s the identical request.
       it('rejects an inverted range instead of answering', async () => {
         const { agent, team } = await getLoggedInAgent(server);
-        const conn = await seedClickHouseConnection(team._id);
+        const source = await seedClickHouseSource(team._id, {
+          tableName: TABLE,
+        });
 
         const res = await agent
           .get('/v1/prometheus/label/__name__/values')
           .query({
-            connectionId: conn._id.toString(),
-            database: DEFAULT_DATABASE,
-            table: TABLE,
+            sourceId: source._id.toString(),
             start: String(RECENT_START),
             end: String(OLD_START),
           })
@@ -1255,14 +1800,14 @@ describe('prometheus router', () => {
 
       it('answers 400 when a selector is not valid PromQL', async () => {
         const { agent, team } = await getLoggedInAgent(server);
-        const conn = await seedClickHouseConnection(team._id);
+        const source = await seedClickHouseSource(team._id, {
+          tableName: TABLE,
+        });
 
         const res = await agent
           .get('/v1/prometheus/label/__name__/values')
           .query({
-            connectionId: conn._id.toString(),
-            database: DEFAULT_DATABASE,
-            table: TABLE,
+            sourceId: source._id.toString(),
             'match[]': 'up{',
           })
           .expect(400);
@@ -1277,22 +1822,22 @@ describe('prometheus router', () => {
   });
 
   describe('GET /v1/prometheus/labels', () => {
-    it('returns 400 when connectionId parameter is missing', async () => {
+    it('returns 400 when sourceId parameter is missing', async () => {
       const { agent } = await getLoggedInAgent(server);
       await agent.get('/v1/prometheus/labels').expect(400);
     });
 
-    it('returns 404 when connection does not exist', async () => {
+    it('returns 404 when source does not exist', async () => {
       const { agent } = await getLoggedInAgent(server);
       await agent
         .get('/v1/prometheus/labels')
-        .query({ connectionId: new Types.ObjectId().toString() })
+        .query({ sourceId: new Types.ObjectId().toString() })
         .expect(404);
     });
 
     it('proxies to upstream Prometheus when connection isPrometheusEndpoint', async () => {
       const { agent, team } = await getLoggedInAgent(server);
-      const conn = await seedPrometheusConnection(team._id);
+      const source = await seedPrometheusSource(team._id);
 
       const promResponse = {
         status: 'success',
@@ -1302,7 +1847,7 @@ describe('prometheus router', () => {
 
       const res = await agent
         .get('/v1/prometheus/labels')
-        .query({ connectionId: conn._id.toString() })
+        .query({ sourceId: source._id.toString() })
         .expect(200);
 
       expect(res.body).toEqual(promResponse);
@@ -1312,12 +1857,12 @@ describe('prometheus router', () => {
 
     it('forwards normalized bounds, limit, and match[] upstream', async () => {
       const { agent, team } = await getLoggedInAgent(server);
-      const conn = await seedPrometheusConnection(team._id);
+      const source = await seedPrometheusSource(team._id);
 
       await agent
         .get('/v1/prometheus/labels')
         .query(
-          `connectionId=${conn._id.toString()}&start=2023-11-14T22:13:20Z` +
+          `sourceId=${source._id.toString()}&start=2023-11-14T22:13:20Z` +
             `&end=1700000060&limit=25&match[]=${encodeURIComponent('up')}`,
         )
         .expect(200);
@@ -1331,11 +1876,11 @@ describe('prometheus router', () => {
 
     it('rejects a malformed bound before reaching upstream', async () => {
       const { agent, team } = await getLoggedInAgent(server);
-      const conn = await seedPrometheusConnection(team._id);
+      const source = await seedPrometheusSource(team._id);
 
       const res = await agent
         .get('/v1/prometheus/labels')
-        .query({ connectionId: conn._id.toString(), start: 'not-a-time' })
+        .query({ sourceId: source._id.toString(), start: 'not-a-time' })
         .expect(400);
 
       expect(res.body).toMatchObject({
@@ -1359,15 +1904,12 @@ describe('prometheus router', () => {
         { match = [] as string[] } = {},
       ) => {
         const { agent, team } = await getLoggedInAgent(server);
-        const conn = await seedClickHouseConnection(team._id);
+        const source = await seedClickHouseSource(team._id, {
+          tableName: TABLE,
+        });
         const res = await agent
           .get('/v1/prometheus/labels')
-          .query({
-            connectionId: conn._id.toString(),
-            database: DEFAULT_DATABASE,
-            table: TABLE,
-            ...query,
-          })
+          .query({ sourceId: source._id.toString(), ...query })
           .query(matchQueryString(match))
           .expect(200);
         return res.body;
@@ -1421,18 +1963,15 @@ describe('prometheus router', () => {
         });
       });
 
-      it('returns 400 when table is missing', async () => {
-        const { agent, team } = await getLoggedInAgent(server);
-        const conn = await seedClickHouseConnection(team._id);
-
-        const res = await agent
-          .get('/v1/prometheus/labels')
-          .query({ connectionId: conn._id.toString() })
-          .expect(400);
-
-        expect(res.body).toMatchObject({
-          status: 'error',
-          error: expect.stringContaining('table'),
+      it("ignores a caller-supplied database/table and reads the source's", async () => {
+        expect(
+          await labels({
+            database: 'no_such_database',
+            table: 'no_such_table',
+          }),
+        ).toEqual({
+          status: 'success',
+          data: ['__name__', 'job', 'region'],
         });
       });
 
@@ -1463,14 +2002,14 @@ describe('prometheus router', () => {
 
       it('answers 400 when a selector is not valid PromQL', async () => {
         const { agent, team } = await getLoggedInAgent(server);
-        const conn = await seedClickHouseConnection(team._id);
+        const source = await seedClickHouseSource(team._id, {
+          tableName: TABLE,
+        });
 
         const res = await agent
           .get('/v1/prometheus/labels')
           .query({
-            connectionId: conn._id.toString(),
-            database: DEFAULT_DATABASE,
-            table: TABLE,
+            sourceId: source._id.toString(),
             'match[]': 'up{',
           })
           .expect(400);
@@ -1489,7 +2028,7 @@ describe('prometheus router', () => {
       const { agent } = await getLoggedInAgent(server);
       const res = await agent
         .get('/v1/prometheus/query_exemplars')
-        .query({ connectionId: new Types.ObjectId().toString() })
+        .query({ sourceId: new Types.ObjectId().toString() })
         .expect(400);
       expect(res.body).toMatchObject({
         status: 'error',
@@ -1498,7 +2037,7 @@ describe('prometheus router', () => {
       });
     });
 
-    it('returns 400 when connectionId is missing', async () => {
+    it('returns 400 when sourceId is missing', async () => {
       const { agent } = await getLoggedInAgent(server);
       const res = await agent
         .get('/v1/prometheus/query_exemplars')
@@ -1507,33 +2046,31 @@ describe('prometheus router', () => {
       expect(res.body).toMatchObject({
         status: 'error',
         errorType: 'bad_data',
-        error: expect.stringContaining('connectionId'),
+        error: expect.stringContaining('sourceId'),
       });
       expect(mockFetch).not.toHaveBeenCalled();
     });
 
-    it('returns 404 for a connection owned by another team', async () => {
+    it('returns 404 for a source owned by another team', async () => {
       const { agent } = await getLoggedInAgent(server);
-      // A real, resolvable connection — just not this team's. The 404 must come
+      // A real, resolvable source — just not this team's. The 404 must come
       // from the team scoping, not from the id simply not existing.
-      const otherTeamConn = await seedPrometheusConnection(
-        new Types.ObjectId(),
-      );
+      const otherTeamSource = await seedPrometheusSource(new Types.ObjectId());
 
       const res = await agent
         .get('/v1/prometheus/query_exemplars')
-        .query({ query: 'up', connectionId: otherTeamConn._id.toString() })
+        .query({ query: 'up', sourceId: otherTeamSource._id.toString() })
         .expect(404);
       expect(res.body).toMatchObject({
         status: 'error',
-        error: 'Connection not found',
+        error: 'Source not found',
       });
       expect(mockFetch).not.toHaveBeenCalled();
     });
 
     it('proxies to upstream Prometheus when connection isPrometheusEndpoint', async () => {
       const { agent, team } = await getLoggedInAgent(server);
-      const conn = await seedPrometheusConnection(team._id);
+      const source = await seedPrometheusSource(team._id);
 
       const promResponse = { status: 'success', data: [] };
       mockFetch.mockResolvedValueOnce(fakeUpstreamResponse(promResponse));
@@ -1544,7 +2081,7 @@ describe('prometheus router', () => {
           query: 'up',
           start: '1700000000',
           end: '1700000060',
-          connectionId: conn._id.toString(),
+          sourceId: source._id.toString(),
         })
         .expect(200);
 
@@ -1560,7 +2097,7 @@ describe('prometheus router', () => {
     // the clamp to bite and inspects what was actually requested.
     it('narrows an over-wide window on the outgoing request and keeps end', async () => {
       const { agent, team } = await getLoggedInAgent(server);
-      const conn = await seedPrometheusConnection(team._id);
+      const source = await seedPrometheusSource(team._id);
 
       mockFetch.mockResolvedValueOnce(
         fakeUpstreamResponse({ status: 'success', data: [] }),
@@ -1575,7 +2112,7 @@ describe('prometheus router', () => {
           query: 'up',
           start: String(end - thirtyDays),
           end: String(end),
-          connectionId: conn._id.toString(),
+          sourceId: source._id.toString(),
         })
         .expect(200);
 
@@ -1594,7 +2131,7 @@ describe('prometheus router', () => {
       // below can only pass if the request's value actually won -- if the
       // host's pinned value were used instead, `end` wouldn't match.
       const hostEnd = end - 3600;
-      const conn = await seedPrometheusConnection(
+      const source = await seedPrometheusSource(
         team._id,
         `http://prom.example.com?start=${hostEnd - thirtyDays}&end=${hostEnd}`,
       );
@@ -1609,7 +2146,7 @@ describe('prometheus router', () => {
           query: 'up',
           start: String(end - thirtyDays),
           end: String(end),
-          connectionId: conn._id.toString(),
+          sourceId: source._id.toString(),
         })
         .expect(200);
 
@@ -1621,7 +2158,7 @@ describe('prometheus router', () => {
 
     it('returns an empty result for ClickHouse-backed connections (no native exemplar table function)', async () => {
       const { agent, team } = await getLoggedInAgent(server);
-      const conn = await seedClickHouseConnection(team._id);
+      const source = await seedClickHouseSource(team._id);
 
       const res = await agent
         .get('/v1/prometheus/query_exemplars')
@@ -1629,7 +2166,7 @@ describe('prometheus router', () => {
           query: 'up',
           start: '1700000000',
           end: '1700000060',
-          connectionId: conn._id.toString(),
+          sourceId: source._id.toString(),
         })
         .expect(200);
 
@@ -1644,15 +2181,15 @@ describe('prometheus router', () => {
     // enough to pin rather than leave to a comment.
     it('validates start/end only on the branch that reaches Prometheus', async () => {
       const { agent, team } = await getLoggedInAgent(server);
-      const prom = await seedPrometheusConnection(team._id);
-      const ch = await seedClickHouseConnection(team._id);
+      const prom = await seedPrometheusSource(team._id);
+      const ch = await seedClickHouseSource(team._id);
 
       await agent
         .get('/v1/prometheus/query_exemplars')
         .query({
           query: 'up',
           start: 'not-a-time',
-          connectionId: prom._id.toString(),
+          sourceId: prom._id.toString(),
         })
         .expect(400);
 
@@ -1661,11 +2198,126 @@ describe('prometheus router', () => {
         .query({
           query: 'up',
           start: 'not-a-time',
-          connectionId: ch._id.toString(),
+          sourceId: ch._id.toString(),
         })
         .expect(200);
 
       expect(res.body).toEqual({ status: 'success', data: [] });
+    });
+  });
+
+  describe('source access', () => {
+    const ROUTES = [
+      ['get', '/v1/prometheus/query_range'],
+      ['post', '/v1/prometheus/query_range'],
+      ['get', '/v1/prometheus/query'],
+      ['post', '/v1/prometheus/query'],
+      ['get', '/v1/prometheus/query_exemplars'],
+      ['post', '/v1/prometheus/query_exemplars'],
+      ['get', '/v1/prometheus/labels'],
+      ['get', '/v1/prometheus/label/job/values'],
+    ] as const;
+
+    // A superset of what any one route reads; the label routes drop the
+    // query/step keys they don't take.
+    const send = (
+      agent: ReturnType<typeof getAgent>,
+      method: 'get' | 'post',
+      path: string,
+      sourceId: string,
+      extra: Record<string, string> = {},
+    ) => {
+      const params = {
+        query: 'up',
+        start: '1700000000',
+        end: '1700000060',
+        step: '15s',
+        sourceId,
+        ...extra,
+      };
+      return method === 'get'
+        ? agent.get(path).query(params)
+        : agent.post(path).type('form').send(params);
+    };
+
+    it.each(ROUTES)(
+      '%s %s returns 404 for a source that is not a PromQL source',
+      async (method, path) => {
+        const { agent, team } = await getLoggedInAgent(server);
+        const promql = await seedPrometheusSource(team._id);
+        const logSource = await Source.create({
+          kind: SourceKind.Log,
+          team: team._id,
+          connection: promql.connection,
+          name: 'Logs',
+          from: { databaseName: DEFAULT_DATABASE, tableName: 'otel_logs' },
+          timestampValueExpression: 'Timestamp',
+        });
+
+        const res = await send(
+          agent,
+          method,
+          path,
+          logSource._id.toString(),
+        ).expect(404);
+
+        expect(res.body).toMatchObject({ error: 'Source not found' });
+        expect(mockFetch).not.toHaveBeenCalled();
+      },
+    );
+
+    describe('on an external Prometheus endpoint', () => {
+      const FORWARDING_ROUTES = [
+        '/v1/prometheus/query_range',
+        '/v1/prometheus/query',
+        '/v1/prometheus/query_exemplars',
+      ];
+
+      // They select a ClickHouse TimeSeries table and mean nothing to a real
+      // Prometheus.
+      it.each(FORWARDING_ROUTES)(
+        'does not forward database/table from %s',
+        async path => {
+          const { agent, team } = await getLoggedInAgent(server);
+          const source = await seedPrometheusSource(team._id);
+
+          await send(agent, 'get', path, source._id.toString(), {
+            database: 'caller_db',
+            table: 'caller_table',
+          }).expect(200);
+
+          const requested = new URL(String(mockFetch.mock.calls[0][0]));
+          expect(requested.searchParams.has('database')).toBe(false);
+          expect(requested.searchParams.has('table')).toBe(false);
+          expect(requested.searchParams.get('query')).toBe('up');
+        },
+      );
+
+      // A host can be a ClickHouse prometheus_api_v1 endpoint that pins its
+      // own table; the caller must not be able to repoint it.
+      it.each(FORWARDING_ROUTES)(
+        'keeps database/table pinned on the connection host for %s',
+        async path => {
+          const { agent, team } = await getLoggedInAgent(server);
+          const source = await seedPrometheusSource(
+            team._id,
+            'http://prom.example.com?database=pinned_db&table=pinned_table',
+          );
+
+          await send(agent, 'get', path, source._id.toString(), {
+            database: 'caller_db',
+            table: 'caller_table',
+          }).expect(200);
+
+          const requested = new URL(String(mockFetch.mock.calls[0][0]));
+          expect(requested.searchParams.getAll('database')).toEqual([
+            'pinned_db',
+          ]);
+          expect(requested.searchParams.getAll('table')).toEqual([
+            'pinned_table',
+          ]);
+        },
+      );
     });
   });
 });

@@ -5,9 +5,13 @@ import PQueue from '@esm2cjs/p-queue';
 import * as clickhouse from '@hyperdx/common-utils/dist/clickhouse';
 import {
   chSqlToAliasMap,
+  type QueryAttribution,
   ResponseJSON,
 } from '@hyperdx/common-utils/dist/clickhouse';
-import { ClickhouseClient } from '@hyperdx/common-utils/dist/clickhouse/node';
+import {
+  ClickhouseClient,
+  withQueryAttribution,
+} from '@hyperdx/common-utils/dist/clickhouse/node';
 import { tryOptimizeConfigWithMaterializedView } from '@hyperdx/common-utils/dist/core/materializedViews';
 import {
   getMetadata,
@@ -20,6 +24,7 @@ import {
 } from '@hyperdx/common-utils/dist/core/searchChartConfig';
 import {
   aliasMapToWithClauses,
+  displayTypeSupportsBuilderAlerts,
   displayTypeSupportsRawSqlAlerts,
   isTimeSeriesDisplayType,
 } from '@hyperdx/common-utils/dist/core/utils';
@@ -27,7 +32,6 @@ import { timeBucketByGranularity } from '@hyperdx/common-utils/dist/core/utils';
 import { getDashboardVariableDeclarations } from '@hyperdx/common-utils/dist/filters';
 import {
   isBuilderChartConfig,
-  isBuilderSavedChartConfig,
   isPromqlSavedChartConfig,
   isRawSqlChartConfig,
   isRawSqlSavedChartConfig,
@@ -96,8 +100,9 @@ import {
   roundDownToXMinutes,
   unflattenObject,
 } from '@/tasks/util';
-import { isPopulatedRef } from '@/utils/alerts';
+import { alertConfigHasGroupBy, isPopulatedRef } from '@/utils/alerts';
 import {
+  getActiveTraceId,
   getCounter,
   type OperationOutcome,
   recordOperationOutcome,
@@ -135,11 +140,6 @@ const alertBatchFailuresCounter = getCounter('hyperdx.alerts.batch_failures', {
  * For tile and inline alerts, groupBy is on the chart config.
  */
 export const alertHasGroupBy = (details: AlertDetails): boolean => {
-  const { alert } = details;
-  if (alert.groupBy && alert.groupBy.length > 0) {
-    return true;
-  }
-
   // AlertChartConfig members are the tile config types minus the embedded
   // alert field, so they're assignable to SavedChartConfig (which the
   // chart-config guards narrow on).
@@ -149,26 +149,7 @@ export const alertHasGroupBy = (details: AlertDetails): boolean => {
       : details.taskType === AlertTaskType.INLINE
         ? details.chartConfig
         : undefined;
-  if (savedConfig == null) {
-    return false;
-  }
-
-  if (
-    isBuilderSavedChartConfig(savedConfig) &&
-    savedConfig.groupBy &&
-    savedConfig.groupBy.length > 0
-  ) {
-    return true;
-  }
-
-  // Without a reliable parser, it's difficult to tell if the raw sql contains a
-  // group by (besides the group by on the interval), so we'll assume it might
-  // in the case of time series charts, and assume it will not in the case of number charts.
-  // Group name will just be blank if there are no group by values.
-  if (isRawSqlSavedChartConfig(savedConfig)) {
-    return savedConfig.displayType !== DisplayType.Number;
-  }
-  return false;
+  return alertConfigHasGroupBy(details.alert.groupBy, savedConfig);
 };
 
 /**
@@ -581,6 +562,7 @@ const fireChannelEvent = async ({
     teamId,
     teamWebhooksById,
     sampleLines,
+    groupValues: attributes,
   });
   return { failures, timings, dispatchDurationMs };
 };
@@ -751,11 +733,7 @@ const buildAlertChartConfigFromSavedConfig = ({
     return undefined;
   }
 
-  if (
-    savedConfig.displayType === DisplayType.Line ||
-    savedConfig.displayType === DisplayType.StackedBar ||
-    savedConfig.displayType === DisplayType.Number
-  ) {
+  if (displayTypeSupportsBuilderAlerts(savedConfig.displayType)) {
     // Alerts can use Log, Trace, or Metric sources.
     // implicitColumnExpression+useTextIndexForImplicitColumn exist on Log and Trace sources;
     // metricTables exists on Metric sources.
@@ -965,6 +943,37 @@ export const parseAlertData = (
 
   return { value, extraFields };
 };
+
+/**
+ * Names the alert, and the tile or search it came from, on each of its
+ * queries. Per evaluation rather than per client, because one client is shared
+ * by every alert on a connection.
+ */
+const sourceId = (source: AlertDetails['source']): string | undefined => {
+  if (typeof source?.id === 'string') return source.id;
+  return isPopulatedRef(source) ? source._id.toString() : undefined;
+};
+
+export const alertQueryAttribution = (
+  details: AlertDetails,
+): QueryAttribution => ({
+  // `?.` everywhere, even where the type says otherwise: a tag must never be
+  // the reason an alert fails to run.
+  surface: 'alert',
+  alert: details.alert?.id,
+  trace: getActiveTraceId(),
+  // `id` is a mongoose virtual and the tile path goes through `toObject()`,
+  // which leaves virtuals out, so that source only has `_id`. Try both, and
+  // check the type: a bare ObjectId has an `id` of its own that is a byte
+  // array, which would satisfy `??` and then be discarded.
+  source: 'source' in details ? sourceId(details.source) : undefined,
+  ...(details.taskType === AlertTaskType.SAVED_SEARCH
+    ? { search: details.savedSearch?.id }
+    : {}),
+  ...(details.taskType === AlertTaskType.TILE
+    ? { dashboard: details.dashboard?.id, tile: details.tile?.id }
+    : {}),
+});
 
 export const processAlert = async (
   now: Date,
@@ -1278,6 +1287,8 @@ export const processAlert = async (
       string,
       { value: number; attributes: Record<string, string>; startTime: Date }
     >();
+    // ponytail: a group that vanished from the data resolves without its values.
+    const groupAttributes = new Map<string, Record<string, string>>();
 
     // Helper to get or create history for a group
     const getOrCreateHistory = (groupKey: string): IAlertHistory => {
@@ -1463,6 +1474,7 @@ export const processAlert = async (
           group: groupKey,
           totalCount: lastValue?.count || 0,
           startTime: lastValue?.startTime || nowInMinsRoundDown,
+          attributes: groupAttributes.get(groupKey),
         });
       }
     };
@@ -1607,7 +1619,6 @@ export const processAlert = async (
       }
 
       // We have at least one data point for this bucket
-
       // Track the worst-case state for each group in this bucket to prevent
       // a subsequent OK row in the SAME bucket from overwriting an ALERT row.
       const bucketEvaluations = new Map<
@@ -1628,6 +1639,7 @@ export const processAlert = async (
           ? extraFields.map(([k, v]) => `${k}:${v}`).join(', ')
           : '';
         const attributes = hasGroupBy ? Object.fromEntries(extraFields) : {};
+        groupAttributes.set(groupKey, attributes);
 
         const exceeds = doesExceedThreshold(alert, value);
 
@@ -2041,13 +2053,19 @@ export default class CheckAlertTask implements HdxTask {
               'processAlert',
               async () => {
                 setBusinessContext({ teamId: conn.team.toString() });
-                await processAlert(
-                  alertTask.now,
-                  alert,
-                  clickhouseClient,
-                  conn.id,
-                  this.provider,
-                  teamWebhooksById,
+                // Set once here, so the alert's own query, the EXPLAIN
+                // probes and the notification's sample rows all get tagged.
+                await withQueryAttribution(
+                  alertQueryAttribution(alert),
+                  async () =>
+                    processAlert(
+                      alertTask.now,
+                      alert,
+                      clickhouseClient,
+                      conn.id,
+                      this.provider,
+                      teamWebhooksById,
+                    ),
                 );
               },
               {
