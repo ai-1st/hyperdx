@@ -50,7 +50,7 @@ export default function AuthPage({ action }: { action: 'register' | 'login' }) {
     reValidateMode: 'onSubmit',
   });
 
-  const { err, msg } = router.query;
+  const { err, msg, loggedOut } = router.query;
 
   const { data: installation } = api.useInstallation();
   const registerPassword = api.useRegisterPassword();
@@ -61,6 +61,7 @@ export default function AuthPage({ action }: { action: 'register' | 'login' }) {
     enabled: boolean;
     label: string;
     loginPath: string;
+    autoRedirect?: boolean;
   } | null>(null);
   useEffect(() => {
     if (action !== 'login') return;
@@ -75,6 +76,20 @@ export default function AuthPage({ action }: { action: 'register' | 'login' }) {
       cancelled = true;
     };
   }, [action]);
+
+  // OIDC_AUTO_REDIRECT: straight to the identity provider, except after
+  // signing out or a failed SSO attempt, which would loop back in.
+  useEffect(() => {
+    if (
+      router.isReady &&
+      ssoConfig?.enabled &&
+      ssoConfig.autoRedirect &&
+      err == null &&
+      loggedOut == null
+    ) {
+      window.location.assign(ssoConfig.loginPath);
+    }
+  }, [router.isReady, ssoConfig, err, loggedOut]);
 
   const verificationSent = msg === 'verify';
   const title = usePageTitle(isRegister ? 'Sign up' : 'Login');

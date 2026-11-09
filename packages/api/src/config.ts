@@ -67,6 +67,10 @@ export const OIDC_CALLBACK_URL = (env.OIDC_CALLBACK_URL ||
 export const OIDC_SCOPE = (env.OIDC_SCOPE ?? 'openid profile email') as string;
 export const OIDC_BUTTON_LABEL = (env.OIDC_BUTTON_LABEL ??
   'Sign in with SSO') as string;
+// Optional. When 'true', the login page sends the browser straight to the
+// identity provider instead of showing the form, unless it was reached by
+// signing out or after a failed SSO attempt (so neither loops back in).
+export const OIDC_AUTO_REDIRECT = env.OIDC_AUTO_REDIRECT === 'true';
 // How the client authenticates at the token endpoint. Default 'client_secret_basic' (HTTP Basic) —
 // the OIDC-preferred method and what providers like OneLogin require. passport-openidconnect's
 // underlying node-oauth otherwise sends creds in the POST body ('client_secret_post'), which a

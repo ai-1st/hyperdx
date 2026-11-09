@@ -57,6 +57,7 @@ OIDC_CALLBACK_URL=https://<your-hyperdx-host>/api/auth/sso/callback
 OIDC_SCOPE="openid profile email"
 OIDC_TOKEN_AUTH_METHOD=client_secret_basic       # or client_secret_post
 # OIDC_ALLOWED_EMAIL_DOMAINS=example.com,corp.example.com   # optional allowlist
+# OIDC_AUTO_REDIRECT=true   # optional: the login page goes straight to the IdP (not after sign-out or a failed attempt)
 ```
 
 In your IdP, register an **OpenID Connect** application with the redirect / callback URL

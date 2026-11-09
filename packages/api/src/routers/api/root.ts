@@ -86,6 +86,7 @@ router.get('/sso/config', (_req, res) => {
     enabled: config.OIDC_ENABLED,
     label: config.OIDC_BUTTON_LABEL,
     loginPath: '/api/login/sso',
+    autoRedirect: config.OIDC_ENABLED && config.OIDC_AUTO_REDIRECT,
   });
 });
 
@@ -170,7 +171,13 @@ router.get('/logout', (req, res, next) => {
     if (err) {
       return next(err);
     }
-    res.redirect(`${config.FRONTEND_REDIRECT_BASE}/login`);
+    // With SSO auto-redirect on, plain /login would send the browser straight
+    // back to the identity provider; loggedOut keeps the user signed out.
+    res.redirect(
+      `${config.FRONTEND_REDIRECT_BASE}/login${
+        config.OIDC_ENABLED && config.OIDC_AUTO_REDIRECT ? '?loggedOut=1' : ''
+      }`,
+    );
   });
 });
 
